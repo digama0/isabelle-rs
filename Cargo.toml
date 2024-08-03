@@ -1,0 +1,11 @@
+[package]
+name = "isabelle-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusqlite = { version = "0.32.0", features = ["bundled"] }
+zstd = "0.13"
+itertools = "0.13"
+
+[workspace]
