@@ -691,13 +691,13 @@ struct Entity<T> {
   file: String,
   id: usize,
   serial: usize,
-  val: T,
+  val: OptBox<T>,
 }
 impl<'a, T: Parse<'a>> Parse<'a> for Entity<T> {
   fn parse1_node(this: &Tree<'a>) -> Self {
     let Tree::Elem(b"entity", props, ts) = this else { panic!() };
     let Properties { name, xname, pos, label, file, id, serial } = Properties::from_attrs(props);
-    Entity { name, xname, pos, label, file, id, serial, val: T::parse(ts) }
+    Entity { name, xname, pos, label, file, id, serial, val: <_>::parse(ts) }
   }
 }
 type Entities<T> = Vec<Entity<T>>;
@@ -766,6 +766,7 @@ struct ConstEntry {
 }
 impl<'a> Parse<'a> for ConstEntry {
   fn parse(t: &[Tree<'a>]) -> Self {
+    println!("{t:?}");
     let (syntax, (args, (ty, (abbrev, propositional)))) = <_>::parse(t);
     Self { syntax, args, ty, abbrev, propositional }
   }
@@ -1050,11 +1051,16 @@ fn main() -> Result<()> {
           }
         }
       };
-      assert!(row.get(4)?);
-      let reader = std::io::Cursor::new(row.get_ref(5)?.as_blob()?);
-      let mut out = vec![];
-      zstd::stream::Decoder::new(reader).unwrap().read_to_end(&mut out).unwrap();
-      let parse = parse(&out);
+      let mut out;
+      let blob = row.get_ref(5)?.as_blob()?;
+      let parse = if row.get(4)? {
+        out = vec![];
+        let reader = std::io::Cursor::new(blob);
+        zstd::stream::Decoder::new(reader).unwrap().read_to_end(&mut out).unwrap();
+        parse(&out)
+      } else {
+        parse(blob)
+      };
       match name {
         RowType::Proof(i) => {
           proofs.insert(i, ProofBox::parse(&parse));
@@ -1095,7 +1101,10 @@ fn main() -> Result<()> {
   }
   for (theory, entities) in &thms {
     for entity in entities {
-      println!("{theory} thm: {entity:#?}\n=> {:#?}", proofs[&entity.serial])
+      println!("{theory} thm: {entity:#?}");
+      if let Some(s) = proofs.get(&entity.serial) {
+        println!("=> {:#?}", s)
+      }
     }
   }
   for (theory, entities) in &classes {
