@@ -7,5 +7,14 @@ edition = "2021"
 rusqlite = { version = "0.32.0", features = ["bundled"] }
 zstd = "0.13"
 itertools = "0.13"
+bit-set = "0.8"
+bumpalo = "3.16"
+ref-cast = "1.0"
+syn = "2.0"
+dbg-pls = { version = "0.4", features = ["colors", "pretty", "derive"] }
+lalrpop-util = { version = "0.20.2", features = ["lexer"] }
+
+[build-dependencies]
+lalrpop = "0.20"
 
 [workspace]

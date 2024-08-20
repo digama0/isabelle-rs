@@ -1,0 +1,62 @@
+use std::str::FromStr;
+use crate::ast::*;
+
+grammar;
+
+match {
+  r"\s*" => { },
+  r"//[^\n\r]*[\n\r]*" => { },
+  r"\(\*([^*]|\*[^)])*\*\)" => { },
+  _
+} else {
+  r"[0-9]+"
+} else {
+  r"[\w.]+"
+}
+
+Comma<T>: Vec<T> = {
+  <mut v:(<T> ",")*> <e:T?> => match e {
+    None => v,
+    Some(e) => { v.push(e); v }
+  }
+};
+
+Atom: &'input str = {
+  <r"[0-9]+"> => <>,
+  <r"[\w.]+"> => <>,
+  <l:r#""[^"]*""#> => &l[1..l.len()-1],
+  <l:r"\\<open>([^\\]|\\([^<]|<([^c]|c([^l]|l([^o]|o([^s]|s([^e]|e[^>])))))))*\\<close>"> =>
+    &l[7..l.len()-8]
+};
+
+Groups = ("(" Atom+ ")")?;
+
+Description = { "description" <Atom>, => "" };
+
+OptionValue = { "-"? Atom };
+OptionSpec = { Atom ("=" <OptionValue>)? };
+Options = { "[" <Comma<OptionSpec>> "]" };
+
+Global: bool = { "(" "global" ")" => true, => false };
+
+InPathParens = ("(" "in" <Atom> ")")?;
+
+Prune: u32 = { "[" <r"[0-9]+"> "]" => u32::from_str(<>).unwrap(), => 0 };
+
+Entry: Entry<'input> = {
+  "chapter_definition" Atom Groups Description => Entry::ChapterDef,
+  "chapter" Atom => Entry::Chapter,
+  "session" <sess:Atom> Groups ("in" <Atom>)? "="
+    <parent:(<Atom> "+")?> Description
+    ("options" <Options>)?
+    ("sessions" <Atom+>)?
+    ("directories" <Atom+>)?
+    ("theories" <Options?> <(Atom Global)+>)*
+    ("document_theories" <Atom+>)?
+    ("document_files" <InPathParens> <Atom+>)*
+    ("export_files" <InPathParens> <Prune> <Atom+>)*
+    ("export_classpath" <Atom+>)?
+    => Entry::Session{<>},
+};
+
+pub Entries = Entry*;

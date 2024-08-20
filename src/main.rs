@@ -1,8 +1,17 @@
+use ast::Entry;
 use itertools::Itertools;
+use kernel::Checker;
+use lalrpop_util::lalrpop_mod;
 use rusqlite::{Connection, Result};
-use std::{collections::HashMap, io::Read, path::Path};
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
+use std::path::Path;
+use trace::ThmTrace;
 
-extern crate self as isabelle_rs;
+pub mod ast;
+pub mod idx;
+pub mod kernel;
+pub mod trace;
 
 enum Tree<'a> {
   Text(&'a [u8]),
@@ -169,21 +178,58 @@ trait Parse<'a>: Sized {
   fn parse1_node(t: &Tree<'a>) -> Self {
     Self::parse(t.as_node())
   }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    Self::parse1(t)
+  }
 }
 impl<'a> Parse<'a> for &'a str {
   fn parse1(t: &Tree<'a>) -> Self {
     let Tree::Text(a) = *t else { panic!() };
     std::str::from_utf8(a).unwrap()
   }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    match *t.as_node() {
+      [Tree::Text(a)] => std::str::from_utf8(a).unwrap(),
+      [] => "",
+      _ => panic!(),
+    }
+  }
 }
 impl<'a> Parse<'a> for String {
   fn parse1(t: &Tree<'a>) -> Self {
     <&str>::parse1(t).to_owned()
   }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    <&str>::parse_v2(t).to_owned()
+  }
 }
 impl<'a> Parse<'a> for usize {
   fn parse1(t: &Tree<'a>) -> Self {
     <&str>::parse1(t).parse().unwrap()
+  }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    <&str>::parse_v2(t).parse().unwrap()
+  }
+}
+impl<'a> Parse<'a> for u32 {
+  fn parse1(t: &Tree<'a>) -> Self {
+    <&str>::parse1(t).parse().unwrap()
+  }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    <&str>::parse_v2(t).parse().unwrap()
+  }
+}
+impl<'a> Parse<'a> for i32 {
+  fn parse1(t: &Tree<'a>) -> Self {
+    <&str>::parse1(t).parse().unwrap()
+  }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    let s = <&str>::parse_v2(t);
+    if let Some(s) = s.strip_prefix("~") {
+      -s.parse::<i32>().unwrap()
+    } else {
+      s.parse().unwrap()
+    }
   }
 }
 impl<'a> Parse<'a> for bool {
@@ -194,16 +240,23 @@ impl<'a> Parse<'a> for bool {
       _ => panic!(),
     }
   }
-}
-impl<'a> Parse<'a> for () {
-  fn parse1(t: &Tree<'a>) -> Self {
-    match <&str>::parse1(t) {
-      "" => (),
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    match <&str>::parse_v2(t) {
+      "0" => false,
+      "1" => true,
       _ => panic!(),
     }
   }
+}
+impl<'a> Parse<'a> for () {
+  fn parse1(t: &Tree<'a>) -> Self {
+    assert_eq!(<&str>::parse1(t), "")
+  }
   fn parse(t: &[Tree<'a>]) -> Self {
     assert!(t.is_empty())
+  }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    assert!(t.as_node().is_empty())
   }
 }
 impl<'a, A: Parse<'a>, B: Parse<'a>> Parse<'a> for (A, B) {
@@ -211,21 +264,53 @@ impl<'a, A: Parse<'a>, B: Parse<'a>> Parse<'a> for (A, B) {
     let [a, b] = t else { panic!() };
     (A::parse1_node(a), B::parse1_node(b))
   }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    let [a, b] = t.as_node() else { panic!() };
+    (A::parse_v2(a), B::parse_v2(b))
+  }
 }
 impl<'a, A: Parse<'a>, B: Parse<'a>, C: Parse<'a>> Parse<'a> for (A, B, C) {
   fn parse(t: &[Tree<'a>]) -> Self {
     let [a, b, c] = t else { panic!() };
     (A::parse1_node(a), B::parse1_node(b), C::parse1_node(c))
   }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    let [a, b, c] = t.as_node() else { panic!() };
+    (A::parse_v2(a), B::parse_v2(b), C::parse_v2(c))
+  }
+}
+impl<'a, A: Parse<'a>, B: Parse<'a>, C: Parse<'a>, D: Parse<'a>> Parse<'a> for (A, B, C, D) {
+  fn parse(t: &[Tree<'a>]) -> Self {
+    let [a, b, c, d] = t else { panic!() };
+    (A::parse1_node(a), B::parse1_node(b), C::parse1_node(c), D::parse1_node(d))
+  }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    let [a, b, c, d] = t.as_node() else { panic!() };
+    (A::parse_v2(a), B::parse_v2(b), C::parse_v2(c), D::parse_v2(d))
+  }
 }
 impl<'a, T: Parse<'a>> Parse<'a> for Vec<T> {
   fn parse(t: &[Tree<'a>]) -> Self {
     t.iter().map(|a| T::parse1_node(a)).collect()
   }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    t.as_node().iter().map(|a| T::parse_v2(a)).collect()
+  }
 }
 impl<'a, T: Parse<'a>> Parse<'a> for Box<T> {
   fn parse(t: &[Tree<'a>]) -> Self {
     Box::new(T::parse(t))
+  }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    Box::new(T::parse_v2(t))
+  }
+}
+impl<'a, T: Parse<'a>> Parse<'a> for Box<[T]> {
+  fn parse(t: &[Tree<'a>]) -> Self {
+    t.iter().map(|a| T::parse1_node(a)).collect()
+  }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    t.as_node().iter().map(|a| T::parse_v2(a)).collect()
   }
 }
 impl<'a, T: Parse<'a>> Parse<'a> for Option<T> {
@@ -233,6 +318,13 @@ impl<'a, T: Parse<'a>> Parse<'a> for Option<T> {
     match t {
       [] => None,
       [a] => Some(T::parse(a.as_node())),
+      _ => panic!(),
+    }
+  }
+  fn parse_v2(t: &Tree<'a>) -> Self {
+    match t.as_node() {
+      [] => None,
+      [a] => Some(T::parse_v2(a)),
       _ => panic!(),
     }
   }
@@ -264,11 +356,18 @@ impl<'a, T: Parse<'a>> Parse<'a> for Option<T> {
 type Class = String;
 type Sort = Vec<Class>;
 
+fn short_name(s: &str) -> &str {
+  match s.split_once('.') {
+    Some((_, s)) => s,
+    _ => s,
+  }
+}
+
 enum Type {
   #[allow(clippy::enum_variant_names)]
   Type(String, Vec<Type>),
   Free(String, Sort),
-  // Var(String, usize, Sort),
+  Var(String, u32, Sort),
 }
 
 impl std::fmt::Debug for Type {
@@ -278,7 +377,7 @@ impl std::fmt::Debug for Type {
         if "fun" == t {
           write!(f, "({:?} -> {:?})", ts[0], ts[1])?;
         } else {
-          write!(f, "{t}")?;
+          write!(f, "{}", short_name(t))?;
           if !ts.is_empty() {
             write!(f, "[{:?}]", ts.iter().format(", "))?;
           }
@@ -291,13 +390,14 @@ impl std::fmt::Debug for Type {
           write!(f, "<:{}", ts.iter().format("+"))?;
         }
         Ok(())
-      } // Self::Var(c, i, ts) => {
-        //   write!(f, "v.{c}.{i}")?;
-        //   if !ts.is_empty() {
-        //     write!(f, "[{:?}]", ts.iter().format(", "))?;
-        //   }
-        //   Ok(())
-        // }
+      }
+      Self::Var(c, i, ts) => {
+        write!(f, "{c}.{i}")?;
+        if !ts.is_empty() {
+          write!(f, "[{:?}]", ts.iter().format(", "))?;
+        }
+        Ok(())
+      }
     }
   }
 }
@@ -326,9 +426,10 @@ impl<'a> Parse<'a> for Type {
 enum Term {
   #[allow(clippy::enum_variant_names)]
   Const(String, Vec<Type>),
+  Const2(String, Box<Type>),
   Free(String, Option<Box<Type>>),
-  // Var(String, usize, Option<Box<Type>>),
-  Bound(usize),
+  Var(String, u32, Option<Box<Type>>),
+  Bound(u32),
   Abs(String, Box<Type>, Box<Term>),
   App(Box<Term>, Box<Term>),
   OfClass(String, Box<Term>),
@@ -340,17 +441,18 @@ impl Term {
   ) -> std::fmt::Result {
     match self {
       Term::Const(c, cs) => {
-        write!(f, "{c}")?;
+        write!(f, "{}", short_name(c))?;
         if !cs.is_empty() {
           write!(f, "({:?})", cs.iter().format(", "))?;
         }
         Ok(())
       }
+      Term::Const2(c, ty) => write!(f, "{c}:{ty:?}"),
       Term::Free(v, None) => write!(f, "{v}"),
       Term::Free(v, Some(ty)) => write!(f, "{v}:{ty:?}"),
-      // Term::Var(v, i, None) => write!(f, "v.{v}.{i}"),
-      // Term::Var(v, i, Some(ty)) => write!(f, "v.{v}.{i}:{ty:?}"),
-      &Term::Bound(i) => write!(f, "{}", ctx[ctx.len() - i - 1]),
+      Term::Var(v, i, None) => write!(f, "v.{v}.{i}"),
+      Term::Var(v, i, Some(ty)) => write!(f, "v.{v}.{i}:{ty:?}"),
+      &Term::Bound(i) => write!(f, "{}", ctx[ctx.len() - i as usize - 1]),
       Term::Abs(x, ty, e) => {
         write!(f, "(fun {x}: {ty:?} => ")?;
         ctx.push(x);
@@ -375,7 +477,7 @@ impl Term {
         write!(f, ")")
       }
       Term::OfClass(c, cs) => {
-        write!(f, "OfClass({c}, ")?;
+        write!(f, "OfClass({}, ", short_name(c))?;
         cs.dbg_fmt(ctx, f)?;
         write!(f, ")")
       }
@@ -591,7 +693,7 @@ impl<'a> Parse<'a> for Proof {
       10 => {
         let [serial, thy, thm, idx] = attrs.take_n();
         let thm_name = (thm, idx.parse().unwrap());
-        assert!(thm_name == (String::new(), 0));
+        // assert!(thm_name == (String::new(), 0));
         Proof::Thm {
           serial: serial.parse().unwrap(),
           theory_name: thy,
@@ -636,6 +738,15 @@ impl<'a> Tree<'a> {
     let attrs = attrs.clone().vector();
     (tag, attrs, ts)
   }
+
+  fn name(&self) -> &'a [u8] {
+    match self {
+      Tree::Text(_) => panic!(),
+      Tree::Elem(name, _, _) => name,
+      Tree::Properties(_) | Tree::Node(_) => b":",
+    }
+  }
+
   fn as_node(&self) -> &[Tree<'a>] {
     match self {
       Tree::Node(ts) => ts,
@@ -643,17 +754,20 @@ impl<'a> Tree<'a> {
       _ => panic!(),
     }
   }
+  fn as_node_n<const N: usize>(&self) -> &[Tree<'a>; N] {
+    self.as_node().try_into().unwrap()
+  }
 }
 
 #[derive(Default)]
 struct Properties {
   name: String,
   xname: String,
-  pos: (usize, usize),
+  pos: (u32, u32),
   label: String,
   file: String,
-  id: usize,
-  serial: usize,
+  id: u32,
+  serial: u32,
 }
 impl Properties {
   fn from_attrs(props: &Attrs<'_>) -> Self {
@@ -686,11 +800,11 @@ impl<'a> Parse<'a> for Properties {
 struct Entity<T> {
   name: String,
   xname: String,
-  pos: (usize, usize),
+  pos: (u32, u32),
   label: String,
   file: String,
-  id: usize,
-  serial: usize,
+  id: u32,
+  serial: u32,
   val: OptBox<T>,
 }
 impl<'a, T: Parse<'a>> Parse<'a> for Entity<T> {
@@ -766,26 +880,51 @@ struct ConstEntry {
 }
 impl<'a> Parse<'a> for ConstEntry {
   fn parse(t: &[Tree<'a>]) -> Self {
-    println!("{t:?}");
     let (syntax, (args, (ty, (abbrev, propositional)))) = <_>::parse(t);
     Self { syntax, args, ty, abbrev, propositional }
   }
 }
 
-type AxiomEntry = Prop;
+#[derive(Debug)]
+enum AxiomReason {
+  Forgot,
+  Axiom,
+  Prim,
+  Def { unchecked: bool, overloaded: bool },
+  ClassRel,
+  Arity,
+}
+impl<'a> Parse<'a> for AxiomReason {
+  fn parse1(t: &Tree<'a>) -> Self {
+    let (tag, _, ts) = t.as_tagged();
+    match tag {
+      0 => Self::Forgot,
+      1 => Self::Axiom,
+      2 => Self::Prim,
+      3 => {
+        let (unchecked, overloaded) = <_>::parse(ts);
+        Self::Def { unchecked, overloaded }
+      }
+      4 => Self::ClassRel,
+      5 => Self::Arity,
+      _ => panic!(),
+    }
+  }
+}
+
+type AxiomEntry = (Prop, AxiomReason);
 
 #[derive(Debug)]
-struct ThmData {
+struct ThmEntry {
   proof: ProofBox,
   deps: Vec<(String, usize)>,
 }
-impl<'a> Parse<'a> for ThmData {
+impl<'a> Parse<'a> for ThmEntry {
   fn parse(t: &[Tree<'a>]) -> Self {
     let (prop, deps, proof) = <_>::parse(t);
     Self { proof: ProofBox { prop, proof }, deps }
   }
 }
-type ThmEntry = OptBox<ThmData>;
 
 #[derive(Debug)]
 enum Recursion {
@@ -832,10 +971,10 @@ impl<'a> Parse<'a> for RoughClassification {
 #[derive(Debug)]
 struct SpecRule {
   name: String,
-  pos: (usize, usize),
+  pos: (u32, u32),
   label: String,
   file: String,
-  id: usize,
+  id: u32,
   class: RoughClassification,
   typargs: Vec<(String, Sort)>,
   args: Vec<(String, Box<Type>)>,
@@ -908,7 +1047,7 @@ impl<'a> Parse<'a> for LocaleArg {
 struct LocaleEntry {
   typargs: Vec<(String, Sort)>,
   args: Vec<LocaleArg>,
-  axioms: Vec<AxiomEntry>,
+  axioms: Vec<Prop>,
 }
 impl<'a> Parse<'a> for LocaleEntry {
   fn parse(t: &[Tree<'a>]) -> Self {
@@ -963,10 +1102,10 @@ impl<'a> Parse<'a> for TypeDef {
 #[derive(Debug)]
 struct Datatype {
   name: String,
-  pos: (usize, usize),
+  pos: (u32, u32),
   label: String,
   file: String,
-  id: usize,
+  id: u32,
   co: bool,
   typargs: Vec<(String, Sort)>,
   typ: Box<Type>,
@@ -980,34 +1119,52 @@ impl<'a> Parse<'a> for Datatype {
   }
 }
 
-fn main() -> Result<()> {
-  let sess = std::env::args().nth(1).unwrap();
-  let path = format!("/home/mario/.isabelle/heaps/polyml-5.9.1_x86_64_32-linux/log/{sess}.db");
-  let file = Path::new(&path);
-  assert!(file.exists());
-  let mut proofs: HashMap<usize, ProofBox> = Default::default();
-  let mut types: Vec<(String, Entities<TypeEntry>)> = vec![];
-  let mut consts: Vec<(String, Entities<ConstEntry>)> = vec![];
-  let mut axioms: Vec<(String, Entities<AxiomEntry>)> = vec![];
-  let mut thms: Vec<(String, Entities<ThmEntry>)> = vec![];
-  let mut classes: Vec<(String, Entities<ClassEntry>)> = vec![];
-  let mut locales: Vec<(String, Entities<LocaleEntry>)> = vec![];
-  let mut other: Vec<(String, String, Entities<()>)> = vec![];
-  let mut const_defs: Vec<(String, Vec<ConstDef>)> = vec![];
-  let mut spec_rules: Vec<(String, Vec<SpecRule>)> = vec![];
-  let mut class_rels: Vec<(String, Vec<ClassRelEntry>)> = vec![];
-  let mut arities: Vec<(String, Vec<Arity>)> = vec![];
-  let mut locale_deps: Vec<(String, Entities<LocaleDepEntry>)> = vec![];
-  let mut type_defs: Vec<(String, Vec<TypeDef>)> = vec![];
-  let mut datatypes: Vec<(String, Vec<Datatype>)> = vec![];
-  {
+#[derive(Default)]
+struct Session {
+  types: Vec<(String, Entities<TypeEntry>)>,
+  consts: Vec<(String, Entities<ConstEntry>)>,
+  axioms: Vec<(String, Entities<AxiomEntry>)>,
+  thms: Vec<(String, Entities<ThmEntry>)>,
+  classes: Vec<(String, Entities<ClassEntry>)>,
+  locales: Vec<(String, Entities<LocaleEntry>)>,
+  other: Vec<(String, String, Entities<()>)>,
+  const_defs: Vec<(String, Vec<ConstDef>)>,
+  spec_rules: Vec<(String, Vec<SpecRule>)>,
+  class_rels: Vec<(String, Vec<ClassRelEntry>)>,
+  arities: Vec<(String, Vec<Arity>)>,
+  locale_deps: Vec<(String, Entities<LocaleDepEntry>)>,
+  type_defs: Vec<(String, Vec<TypeDef>)>,
+  datatypes: Vec<(String, Vec<Datatype>)>,
+  parents: Vec<String>,
+}
+
+struct Axiom {
+  sess: &'static str,
+  i: u32,
+  j: u32,
+}
+
+#[derive(Default)]
+pub struct Global {
+  proofs: HashMap<u32, ProofBox>,
+  traces: HashMap<u32, ThmTrace>,
+  axioms: HashMap<String, Axiom>,
+}
+
+impl Global {
+  fn load_session(&mut self, sess: &'static str, proofs: bool) -> Result<Box<Session>> {
+    let path = format!("/home/mario/.isabelle/heaps/polyml-5.9.1_x86_64_32-linux/log/{sess}.db");
+    let file = Path::new(&path);
+    assert!(file.exists(), "could not find {:?}", sess);
     let db = Connection::open(file)?;
     let mut q = db.prepare("select * from isabelle_exports")?;
     let mut rows = q.query(())?;
+    let mut data = Box::new(Session::default());
     while let Some(row) = rows.next()? {
       #[derive(Debug)]
       enum RowType<'a> {
-        Proof(usize),
+        Proof(u32),
+        Trace(u32),
         Types(&'a str),
         Consts(&'a str),
         Axioms(&'a str),
@@ -1026,7 +1183,15 @@ fn main() -> Result<()> {
       let name = {
         let s = row.get_ref(2)?.as_str()?;
         if let Some(s) = s.strip_prefix("proofs/") {
+          if !proofs {
+            continue;
+          }
           RowType::Proof(s.parse().unwrap())
+        } else if let Some(s) = s.strip_prefix("proof_trace/") {
+          if !proofs {
+            continue;
+          }
+          RowType::Trace(s.parse().unwrap())
         } else {
           let theory = row.get_ref(1)?.as_str()?;
           if let Some(s) = s.strip_prefix("theory/other/") {
@@ -1046,6 +1211,12 @@ fn main() -> Result<()> {
               "theory/spec_rules" => RowType::SpecRules(theory),
               "theory/typedefs" => RowType::TypeDefs(theory),
               "theory/datatypes" => RowType::Datatypes(theory),
+              "theory/parents" => {
+                for s in std::str::from_utf8(row.get_ref(5)?.as_blob()?).unwrap().lines() {
+                  data.parents.push(s.trim().to_owned())
+                }
+                continue;
+              }
               _ => continue,
             }
           }
@@ -1053,112 +1224,278 @@ fn main() -> Result<()> {
       };
       let mut out;
       let blob = row.get_ref(5)?.as_blob()?;
-      let parse = if row.get(4)? {
+      let blob = if row.get(4)? {
         out = vec![];
         let reader = std::io::Cursor::new(blob);
         zstd::stream::Decoder::new(reader).unwrap().read_to_end(&mut out).unwrap();
-        parse(&out)
+        &out
       } else {
-        parse(blob)
+        blob
       };
+      let blob = parse(blob);
       match name {
         RowType::Proof(i) => {
-          proofs.insert(i, ProofBox::parse(&parse));
+          self.proofs.insert(i, ProofBox::parse(&blob));
         }
-        RowType::Types(theory) => types.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::Consts(theory) => consts.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::Axioms(theory) => axioms.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::Thms(theory) => thms.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::ConstDefs(theory) => const_defs.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::SpecRules(theory) => spec_rules.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::Classes(theory) => classes.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::ClassRels(theory) => class_rels.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::Arities(theory) => arities.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::Locales(theory) => locales.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::LocaleDeps(theory) => locale_deps.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::TypeDefs(theory) => type_defs.push((theory.to_owned(), <_>::parse(&parse))),
-        RowType::Datatypes(theory) => datatypes.push((theory.to_owned(), <_>::parse(&parse))),
+        RowType::Trace(i) => {
+          self.traces.insert(i, ThmTrace::parse_v2(&Tree::Node(blob)));
+        }
+        RowType::Types(theory) => data.types.push((theory.to_owned(), <_>::parse(&blob))),
+        RowType::Consts(theory) => data.consts.push((theory.to_owned(), <_>::parse(&blob))),
+        RowType::Axioms(theory) => data.axioms.push((theory.to_owned(), <_>::parse(&blob))),
+        RowType::Thms(theory) => {
+          let mut thms = Entities::parse(&blob);
+          if !proofs {
+            for e in &mut thms {
+              e.val.0.take();
+            }
+          }
+          data.thms.push((theory.to_owned(), thms));
+        }
+        RowType::ConstDefs(theory) => data.const_defs.push((theory.to_owned(), <_>::parse(&blob))),
+        RowType::SpecRules(theory) => data.spec_rules.push((theory.to_owned(), <_>::parse(&blob))),
+        RowType::Classes(theory) => data.classes.push((theory.to_owned(), <_>::parse(&blob))),
+        RowType::ClassRels(theory) => data.class_rels.push((theory.to_owned(), <_>::parse(&blob))),
+        RowType::Arities(theory) => data.arities.push((theory.to_owned(), <_>::parse(&blob))),
+        RowType::Locales(theory) => data.locales.push((theory.to_owned(), <_>::parse(&blob))),
+        RowType::LocaleDeps(theory) => {
+          data.locale_deps.push((theory.to_owned(), <_>::parse(&blob)))
+        }
+        RowType::TypeDefs(theory) => data.type_defs.push((theory.to_owned(), <_>::parse(&blob))),
+        RowType::Datatypes(theory) => data.datatypes.push((theory.to_owned(), <_>::parse(&blob))),
         RowType::Other(theory, kind) => {
-          other.push((theory.to_owned(), kind.to_owned(), <_>::parse(&parse)))
+          data.other.push((theory.to_owned(), kind.to_owned(), <_>::parse(&blob)))
+        }
+      }
+    }
+    Ok(data)
+  }
+}
+
+lalrpop_mod!(root);
+
+fn main() -> Result<()> {
+  let isabelle_root = std::path::PathBuf::from("/home/mario/Documents/isabelle");
+  let p = root::EntriesParser::new();
+  let main = &*std::env::args().nth(1).unwrap().leak();
+  let mut g = Global::default();
+  let mut stack = vec![];
+  {
+    let mut parents: HashMap<String, Option<String>> = Default::default();
+    for root in std::fs::read_to_string(isabelle_root.join("ROOTS")).unwrap().lines() {
+      let s = std::fs::read_to_string(isabelle_root.join(root).join("ROOT")).unwrap();
+      for e in p.parse(&s).unwrap() {
+        if let Entry::Session { sess, parent } = e {
+          parents.insert(sess.into(), parent.map(String::from));
+        }
+      }
+    }
+    let mut sess = main;
+    while let Some(i) = &parents[sess] {
+      stack.push(&*i.to_owned().leak());
+      sess = i;
+    }
+  }
+  let mut parents = vec![];
+  for sess in stack.iter().rev() {
+    parents.push((*sess, g.load_session(sess, false)?));
+  }
+  let sess = g.load_session(main, true)?;
+  for (name, sess) in parents.iter().map(|(x, y)| (*x, y)).chain(std::iter::once((main, &sess))) {
+    for (i, (_, axioms)) in sess.axioms.iter().enumerate() {
+      let i = i as u32;
+      for (j, e) in axioms.iter().enumerate() {
+        let j = j as u32;
+        assert!(g.axioms.insert(e.name.clone(), Axiom { sess: name, i, j }).is_none());
+      }
+    }
+  }
+  for (name, sess) in parents.iter().map(|(x, y)| (*x, y)).chain(std::iter::once((main, &sess))) {
+    for (i, (_, const_defs)) in sess.const_defs.iter().enumerate() {
+      let i = i as u32;
+      for (j, e) in const_defs.iter().enumerate() {
+        let j = j as u32;
+        println!("const_def {}: {}", e.name, e.axiom);
+        // assert!(g.axioms.insert(e.name.clone(), Axiom { sess: name, i, j }).is_none());
+      }
+    }
+  }
+  for (name, sess) in parents.iter().map(|(x, y)| (*x, y)).chain(std::iter::once((main, &sess))) {
+    for (theory, entities) in &sess.types {
+      for entity in entities {
+        println!("{theory} type: {}", entity.name)
+      }
+    }
+    for (theory, entities) in &sess.consts {
+      for entity in entities {
+        println!("{theory} const: {}", entity.name)
+      }
+    }
+    for (theory, entities) in &sess.axioms {
+      for entity in entities {
+        println!("{theory} axiom: {}", entity.name);
+        if let Some(x) = &entity.val.0 {
+          println!("  = {:?}", x.1)
+        }
+      }
+    }
+    for (theory, entities) in &sess.thms {
+      for entity in entities {
+        println!("{theory} thm: {}", entity.name);
+        // if let Some(s) = g.proofs.get(&entity.serial) {
+        //   println!("=> {:#?}", s)
+        // }
+        // if let Some(s) = g.traces.get(&entity.serial) {
+        //   println!("=> {:#?}", s)
+        // }
+      }
+    }
+    for (theory, entities) in &sess.classes {
+      for entity in entities {
+        println!("{theory} class: {}", entity.name);
+        if let Some(x) = &entity.val.0 {
+          println!("  = {:?}", x)
+        } else {
+          println!("  = none")
+        }
+      }
+    }
+    for (theory, entities) in &sess.locales {
+      for entity in entities {
+        println!("{theory} locale: {}", entity.name)
+      }
+    }
+    for (theory, entities) in &sess.class_rels {
+      for entity in entities {
+        println!("{theory} class_rel: {} -> {}", entity.c1, entity.c2)
+      }
+    }
+    for (theory, entities) in &sess.arities {
+      for entity in entities {
+        println!("{theory} arity: {}", entity.type_name)
+      }
+    }
+    for (theory, kind, entities) in &sess.other {
+      for entity in entities {
+        println!("{theory} {kind}: {}", entity.name)
+      }
+    }
+    for (theory, entities) in &sess.const_defs {
+      for entity in entities {
+        println!("{theory} const_def: {}", entity.name)
+      }
+    }
+    for (theory, entities) in &sess.spec_rules {
+      for entity in entities {
+        println!("{theory} spec_rule: {}", entity.name)
+      }
+    }
+    for (theory, entities) in &sess.locale_deps {
+      for entity in entities {
+        println!("{theory} locale_dep: {}", entity.name)
+      }
+    }
+    for (theory, entities) in &sess.type_defs {
+      for entity in entities {
+        println!("{theory} type_def: {}", entity.name)
+      }
+    }
+    for (theory, entities) in &sess.datatypes {
+      for entity in entities {
+        println!("{theory} datatype: {}", entity.name)
+      }
+    }
+  }
+  let mut gthms: HashMap<u32, (usize, usize, usize)> = Default::default();
+  for (i, (_, sess)) in parents.iter().enumerate() {
+    for (j, (_, thms)) in sess.thms.iter().enumerate() {
+      for (k, thm) in thms.iter().enumerate() {
+        gthms.insert(thm.serial, (i, j, k));
+      }
+    }
+  }
+  // for (&i, p) in &g.proofs {
+  //   println!("proofs/{i}: {p:#?}")
+  // }
+  #[derive(Debug)]
+  enum Uses {
+    Once,
+    Multiple,
+    Public,
+  }
+  let mut uses: HashMap<u32, Uses> = Default::default();
+  {
+    let mut queue: Vec<u32> = vec![];
+    for (_, e) in &sess.thms {
+      for entity in e {
+        if g.traces.contains_key(&entity.serial) {
+          uses.insert(entity.serial, Uses::Public);
+          queue.push(entity.serial);
+        }
+      }
+    }
+    let mut reachable: HashSet<u32> = Default::default();
+    while let Some(i) = queue.pop() {
+      if reachable.insert(i) {
+        for pr in &g.traces[&i].ctx.proofs.0 {
+          if let &trace::Proof::Thm(j) = pr {
+            if !gthms.contains_key(&j) {
+              match uses.entry(j) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                  if let Uses::Once = *e.get() {
+                    e.insert(Uses::Multiple);
+                  }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                  e.insert(Uses::Once);
+                }
+              }
+              queue.push(j)
+            }
+          }
         }
       }
     }
   }
-  for (theory, entities) in &types {
-    for entity in entities {
-      println!("{theory} type: {entity:#?}")
-    }
-  }
-  for (theory, entities) in &consts {
-    for entity in entities {
-      println!("{theory} const: {entity:#?}")
-    }
-  }
-  for (theory, entities) in &axioms {
-    for entity in entities {
-      println!("{theory} axiom: {entity:#?}")
-    }
-  }
-  for (theory, entities) in &thms {
-    for entity in entities {
-      println!("{theory} thm: {entity:#?}");
-      if let Some(s) = proofs.get(&entity.serial) {
-        println!("=> {:#?}", s)
+  for entity in sess.axioms.iter().flat_map(|(_, x)| x) {
+    match entity.val.0.as_deref() {
+      None => panic!("axiom {} not exported", entity.name),
+      Some((_, AxiomReason::Forgot)) => panic!("axiom missing provenance"),
+      Some((_, AxiomReason::Def { unchecked: false, overloaded: false })) => {
+        // todo: definition checking
       }
+      Some((_, AxiomReason::Axiom)) => {
+        println!("user axiom {}: {:?}", entity.name, entity.val.0.as_deref().unwrap().0.prop)
+      }
+      Some((_, AxiomReason::Prim)) => {
+        assert!(matches!(
+          &*entity.name,
+          "Pure.reflexive"
+            | "Pure.symmetric"
+            | "Pure.transitive"
+            | "Pure.equal_intr"
+            | "Pure.equal_elim"
+            | "Pure.abstract_rule"
+            | "Pure.combination"
+        ))
+      }
+      Some((_, r)) => todo!("reason: {r:?}"),
     }
   }
-  for (theory, entities) in &classes {
-    for entity in entities {
-      println!("{theory} class: {entity:#?}")
-    }
+  let mut v = uses.iter().filter(|x| !matches!(x.1, Uses::Once)).map(|x| *x.0).collect::<Vec<_>>();
+  v.sort();
+  for i in v {
+    let p = &g.traces[&i];
+    println!(
+      "proof_trace/{i} = {:?}.{} -> {:?}",
+      p.ctx.strings[p.header.thm_name.name],
+      p.header.thm_name.i,
+      uses.get(&i),
+    );
+    Checker::new(&bumpalo::Bump::new(), &g).check(p);
   }
-  for (theory, entities) in &locales {
-    for entity in entities {
-      println!("{theory} locale: {entity:#?}")
-    }
-  }
-  for (theory, entities) in &class_rels {
-    for entity in entities {
-      println!("{theory} class_rel: {entity:#?}")
-    }
-  }
-  for (theory, entities) in &arities {
-    for entity in entities {
-      println!("{theory} arity: {entity:#?}")
-    }
-  }
-  for (theory, kind, entities) in &other {
-    for entity in entities {
-      println!("{theory} {kind}: {entity:#?}")
-    }
-  }
-  for (theory, entities) in &const_defs {
-    for entity in entities {
-      println!("{theory} const_def: {entity:#?}")
-    }
-  }
-  for (theory, entities) in &spec_rules {
-    for entity in entities {
-      println!("{theory} spec_rule: {entity:#?}")
-    }
-  }
-  for (theory, entities) in &locale_deps {
-    for entity in entities {
-      println!("{theory} locale_dep: {entity:#?}")
-    }
-  }
-  for (theory, entities) in &type_defs {
-    for entity in entities {
-      println!("{theory} type_def: {entity:#?}")
-    }
-  }
-  for (theory, entities) in &datatypes {
-    for entity in entities {
-      println!("{theory} datatype: {entity:#?}")
-    }
-  }
-  // for (i, p) in proofs.iter().enumerate() {
-  //   println!("proofs/{i}: {p:#?}")
+  // for (i, p) in &g.traces {
+  //   p.root.0.thm_name.name
   // }
   Ok(())
 }
