@@ -235,6 +235,12 @@ impl<I> std::fmt::Debug for IdxBitSet<I> {
   }
 }
 
+impl<I: Idx + dbg_pls::DebugPls> dbg_pls::DebugPls for IdxBitSet<I> {
+  fn fmt(&self, f: dbg_pls::Formatter<'_>) {
+    f.debug_list().entries(self.iter()).finish()
+  }
+}
+
 impl<I> Clone for IdxBitSet<I> {
   fn clone(&self) -> Self {
     Self(self.0.clone(), PhantomData)

@@ -4,7 +4,7 @@ use std::{
   hash::Hash,
 };
 
-use dbg_pls::pretty;
+use dbg_pls::{pretty, DebugPls};
 use ref_cast::RefCast;
 
 use crate::{
@@ -34,13 +34,13 @@ trait TempKey<'a, K>: Hash + Eq + Sized {
   fn upgrade(&self, ck: &Checker<'a>) -> K;
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, DebugPls, Hash, PartialEq, Eq)]
 pub enum LCtx {
   Nil,
   Cons(LCtxId, TypeId),
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, DebugPls, Hash, PartialEq, Eq)]
 pub enum Type<'a> {
   Type(StringId, &'a [TypeId]),
   Free(StringId, SortId),
@@ -93,7 +93,7 @@ impl<'a: 'b, 'b> TempKey<'a, &'a str> for &'b str {
   }
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, DebugPls, Clone, Hash, PartialEq, Eq)]
 struct CProof {
   shyps: SortsId,
   hyps: HypsId,
@@ -110,7 +110,7 @@ macro_rules! mk_checker_ctx {
   (struct CheckerCtx<$a:lifetime> {
     $($field:ident: $id:ty => ($tty:ty, $cty:ty, $d:ty) $(reg $($reg:literal)?)? $((data $($data:tt)*))?,)*
   }) => {
-    #[derive(Default)]
+    #[derive(Debug, DebugPls, Default)]
     struct CheckerCtx<$a> {
       $($field: Lookup<$id, $cty, $d>,)*
     }
@@ -189,7 +189,7 @@ trait HasAccessors<T>: Idx {
   fn get_mut(_: &mut T) -> &mut IdxVec<Self, Self::Val>;
 }
 trait HasAlloc<'a>: HasAccessors<CheckerCtx<'a>, Val = (Self::Key, Self::Data)> {
-  type Key: Clone + Hash + Eq;
+  type Key: Clone + Hash + Eq + std::fmt::Debug;
   type Data;
   fn get_alloc<'b>(cc: &'b mut CheckerCtx<'a>) -> &'b mut Lookup<Self, Self::Key, Self::Data>;
   fn mk_data(ck: &mut Checker<'a>, k: &Self::Key) -> Self::Data;
@@ -201,7 +201,6 @@ trait Mappable<'a>:
   where
     <Self as HasAccessors<Context>>::Val: Internable<'a, Output = <Self as HasAlloc<'a>>::Key> + 'a,
   {
-    println!("interning {:?} {}", std::any::type_name::<Self>(), self.into_usize());
     match Self::get(m)[self] {
       Some(i) => i,
       None => {
@@ -213,6 +212,12 @@ trait Mappable<'a>:
     }
   }
 }
+
+trait BitSetIdx<'a>: HasAlloc<'a, Key = IdxBitSet<Self::Elem>> {
+  const EMPTY: Self;
+  type Elem: Idx;
+}
+
 trait Internable<'a> {
   type Output: Sized + 'a;
   fn intern(&'a self, cc: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self::Output;
@@ -300,9 +305,10 @@ impl<'a> Internable<'a> for Proof {
 
 impl<'a> Internable<'a> for trace::Sorts {
   type Output = IdxBitSet<ClassId>;
-  fn intern(&'a self, ck: &mut Checker<'a>, _: &mut Mapping, _: &'a Context) -> Self::Output {
+  fn intern(&'a self, ck: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self::Output {
     let mut out = IdxBitSet::new();
     for &c in &self.0 {
+      let c = c.intern(ck, m, ctx);
       out.insert(ck.alloc(c));
     }
     out
@@ -337,16 +343,34 @@ impl<T: Treeify> Treeify for Vec<T> {
     (**self).treeify(ctx)
   }
 }
+impl<I: Treeify + Idx> Treeify for IdxBitSet<I> {
+  type Output = Vec<I::Output>;
+  fn treeify(&self, ctx: &CheckerCtx<'_>) -> Self::Output {
+    self.iter().map(|i| i.treeify(ctx)).collect()
+  }
+}
 impl Treeify for StringId {
   type Output = String;
   fn treeify(&self, ctx: &CheckerCtx<'_>) -> Self::Output {
     ctx[*self].0.to_owned()
   }
 }
+impl Treeify for ClassId {
+  type Output = crate::Class;
+  fn treeify(&self, ctx: &CheckerCtx<'_>) -> Self::Output {
+    ctx[*self].0.treeify(ctx)
+  }
+}
 impl Treeify for SortId {
   type Output = crate::Sort;
   fn treeify(&self, ctx: &CheckerCtx<'_>) -> Self::Output {
-    ctx[*self].0.iter().map(|c| ctx[c].0.treeify(ctx)).collect()
+    ctx[*self].0.treeify(ctx)
+  }
+}
+impl Treeify for SortsId {
+  type Output = Vec<crate::Sort>;
+  fn treeify(&self, ctx: &CheckerCtx<'_>) -> Self::Output {
+    ctx[*self].0.treeify(ctx)
   }
 }
 impl Treeify for IndexNameId {
@@ -387,14 +411,20 @@ impl Treeify for TermId {
     }
   }
 }
+impl Treeify for HypId {
+  type Output = crate::Term;
+  fn treeify(&self, ctx: &CheckerCtx<'_>) -> Self::Output {
+    ctx[*self].0.treeify(ctx)
+  }
+}
 impl Treeify for HypsId {
   type Output = Vec<crate::Term>;
   fn treeify(&self, ctx: &CheckerCtx<'_>) -> Self::Output {
-    ctx[*self].0.iter().map(|i| ctx[i].0.treeify(ctx)).collect()
+    ctx[*self].0.treeify(ctx)
   }
 }
 
-#[derive(Clone)]
+#[derive(Debug, DebugPls, Clone)]
 struct TypeData {
   sorts: SortsId,
   maxidx: MaxIdx,
@@ -403,7 +433,7 @@ impl TypeData {
   fn mk(ck: &mut Checker<'_>, t: &Type) -> TypeData {
     match *t {
       Type::Type(_, ts) => match ts {
-        [] => TypeData { sorts: SortsId::NONE, maxidx: MaxIdx::NONE },
+        [] => TypeData { sorts: SortsId::EMPTY, maxidx: MaxIdx::NONE },
         &[t] => ck.ctx[t].1.clone(),
         _ => {
           let mut sorts = IdxBitSet::new();
@@ -423,6 +453,7 @@ impl TypeData {
   }
 }
 
+#[derive(Debug, DebugPls)]
 struct TermData {
   sorts: SortsId,
   maxidx: MaxIdx,
@@ -444,12 +475,12 @@ impl TermData {
       Term::Var(i, ty) => {
         TermData { sorts: ck.ctx[ty].1.sorts, maxidx: MaxIdx::var(ck.ctx[i].0 .1), ty: Ok(ty) }
       }
-      Term::Bound(i) => TermData { sorts: SortsId::NONE, maxidx: MaxIdx::NONE, ty: Err(i) },
+      Term::Bound(i) => TermData { sorts: SortsId::EMPTY, maxidx: MaxIdx::NONE, ty: Err(i) },
       Term::Abs(_, dom, e) => {
         let TypeData { sorts: ds, maxidx: dm } = ck.ctx[dom].1;
         let TermData { sorts: es, maxidx: em, ty } = ck.ctx[e].1;
         let maxidx = dm.max(em);
-        let sorts = ck.union_sorts(ds, es);
+        let sorts = ck.union(ds, es);
         let ty = match ty {
           Ok(rng) => Ok(ck.mk_fun(dom, rng)),
           Err(0) => {
@@ -464,7 +495,7 @@ impl TermData {
         let TermData { sorts: s1, maxidx: m1, ty: ty1 } = ck.ctx[e1].1;
         let TermData { sorts: s2, maxidx: m2, ty: _ } = ck.ctx[e2].1;
         let ty = ty1.map(|ty| ck.ctx[ty].0.as_fun().1);
-        let sorts = ck.union_sorts(s1, s2);
+        let sorts = ck.union(s1, s2);
         TermData { sorts, maxidx: m1.max(m2), ty }
       }
     }
@@ -475,12 +506,13 @@ impl TermData {
 struct OfClassCache {
   itself: StringId,
   type_: StringId,
-  prop: TypeId,
 }
 
 pub struct Checker<'a> {
   ctx: CheckerCtx<'a>,
   type_cache: HashMap<(LCtxId, TermId), TypeId>,
+  eq: Option<StringId>,
+  imp: Option<TermId>,
   ofclass_cache: Option<OfClassCache>,
   alloc: &'a bumpalo::Bump,
   g: &'a Global,
@@ -490,17 +522,22 @@ impl StringId {
   const FUN: Self = Self(0);
   const PROP: Self = Self(1);
 }
-impl HypsId {
-  const ZERO: Self = Self(0);
+impl BitSetIdx<'_> for HypsId {
+  const EMPTY: Self = Self(0);
+  type Elem = HypId;
 }
 impl SortId {
   const TOP: Self = Self(0);
 }
-impl SortsId {
-  const NONE: Self = Self(0);
+impl BitSetIdx<'_> for SortsId {
+  const EMPTY: Self = Self(0);
+  type Elem = SortId;
 }
 impl LCtxId {
   const NIL: Self = Self(0);
+}
+impl TypeId {
+  const PROP: Self = Self(0);
 }
 
 impl<'a> Checker<'a> {
@@ -511,6 +548,8 @@ impl<'a> Checker<'a> {
       g,
       type_cache: Default::default(),
       ofclass_cache: None,
+      eq: None,
+      imp: None,
     };
     ck.alloc::<StringId>("fun");
     ck.alloc::<StringId>("prop");
@@ -518,6 +557,7 @@ impl<'a> Checker<'a> {
     ck.alloc::<SortId>(IdxBitSet::new());
     ck.alloc::<SortsId>(IdxBitSet::new());
     ck.alloc::<LCtxId>(LCtx::Nil);
+    ck.alloc::<TypeId>(Type::Type(StringId::PROP, &[]));
     ck
   }
 
@@ -532,6 +572,7 @@ impl<'a> Checker<'a> {
       let v = I::mk_data(self, &k);
       let a = I::get_alloc(&mut self.ctx);
       let i = a.0.push((k.clone(), v));
+      // println!("alloc {} {i:?} = {k:?}", std::any::type_name::<I>());
       a.1.insert(k, i);
       i
     }
@@ -557,22 +598,35 @@ impl<'a> Checker<'a> {
     self.alloc_copy(&Type::Type(StringId::FUN, &[a, b]))
   }
 
-  fn dest_fun(&self, a: TypeId) -> (TypeId, TypeId) {
-    let Type::Type(StringId::FUN, &[a, b]) = self.ctx[a].0 else { panic!("expected function") };
-    (a, b)
+  fn try_dest_fun(&self, a: TypeId) -> Option<(TypeId, TypeId)> {
+    let Type::Type(StringId::FUN, &[a, b]) = self.ctx[a].0 else { return None };
+    Some((a, b))
   }
+
+  fn dest_fun(&self, a: TypeId) -> (TypeId, TypeId) {
+    self.try_dest_fun(a).expect("expected function")
+  }
+
   fn mk_lctx(&mut self, lctx: LCtxId, ty: TypeId) -> LCtxId {
     self.alloc(LCtx::Cons(lctx, ty))
   }
 
+  fn try_dest_app(&self, a: TermId) -> Option<(TermId, TermId)> {
+    let Term::App(e1, e2) = self.ctx[a].0 else { return None };
+    Some((e1, e2))
+  }
+
   fn dest_app(&self, a: TermId) -> (TermId, TermId) {
-    let Term::App(e1, e2) = self.ctx[a].0 else { panic!("expected application") };
-    (e1, e2)
+    self.try_dest_app(a).expect("expected application")
+  }
+
+  fn try_dest_const(&self, a: TermId) -> Option<(StringId, TypeId)> {
+    let Term::Const(s, ty) = self.ctx[a].0 else { return None };
+    Some((s, ty))
   }
 
   fn dest_const(&self, a: TermId) -> (StringId, TypeId) {
-    let Term::Const(s, ty) = self.ctx[a].0 else { panic!("expected constant") };
-    (s, ty)
+    self.try_dest_const(a).expect("expected constant")
   }
 
   fn dest_type<const N: usize>(&self, a: TypeId) -> (StringId, &'a [TypeId; N]) {
@@ -585,25 +639,82 @@ impl<'a> Checker<'a> {
     (x, s)
   }
 
-  fn dest_imp(&self, a: TermId) -> (TermId, TermId) {
-    let (f, e2) = self.dest_app(a);
-    let (f, e1) = self.dest_app(f);
-    let (c, _) = self.dest_const(f);
-    assert!(self.ctx[c].0 == "Pure.imp");
-    (e1, e2)
+  fn try_dest_imp(&self, a: TermId) -> Option<(TermId, TermId)> {
+    let (f, e2) = self.try_dest_app(a)?;
+    let (f, e1) = self.try_dest_app(f)?;
+    let (c, _) = self.try_dest_const(f)?;
+    if self.ctx[c].0 != "Pure.imp" {
+      return None;
+    }
+    Some((e1, e2))
   }
 
-  fn dest_ofclass(&self, a: TermId) -> (TypeId, ClassId) {
+  fn dest_imp(&self, a: TermId) -> (TermId, TermId) {
+    self.try_dest_imp(a).expect("expected implication")
+  }
+  fn mk_imp_term(&mut self) -> TermId {
+    self.imp.unwrap_or_else(|| {
+      let ty = self.mk_fun(TypeId::PROP, TypeId::PROP);
+      let ty = self.mk_fun(TypeId::PROP, ty);
+      let s = self.alloc("Pure.imp");
+      let imp = self.alloc(Term::Const(s, ty));
+      *self.imp.insert(imp)
+    })
+  }
+
+  fn mk_imp(&mut self, a: TermId, b: TermId) -> TermId {
+    let f = self.mk_imp_term();
+    let f = self.alloc(Term::App(f, a));
+    self.alloc(Term::App(f, b))
+  }
+
+  fn try_dest_forall(&self, a: TermId) -> Option<(TypeId, TermId)> {
+    let (f, e) = self.try_dest_app(a)?;
+    let (c, ty) = self.try_dest_const(f)?;
+    if self.ctx[c].0 != "Pure.all" {
+      return None;
+    }
+    let (ty, _) = self.try_dest_fun(ty)?;
+    let (qary, _) = self.try_dest_fun(ty)?;
+    Some((qary, e))
+  }
+
+  fn dest_forall(&self, a: TermId) -> (TypeId, TermId) {
+    self.try_dest_forall(a).expect("expected forall")
+  }
+
+  fn dest_ofclass(&mut self, a: TermId) -> (TypeId, ClassId) {
     let (c, ty) = self.dest_const(self.dest_app(a).0);
     let &[ty] = self.dest_type(self.dest_fun(ty).0).1;
     let cl = self.ctx[c].0.strip_suffix("_class").expect("expected FOO_class");
-    (ty, self.ctx.classes.1[&self.ctx.strings.1[cl]])
+    let s = self.alloc(cl);
+    (ty, self.alloc(s))
   }
 
-  fn union_sorts(&mut self, s1: SortsId, s2: SortsId) -> SortsId {
-    if s1 == SortsId::NONE {
+  fn mk_eq_str(&mut self) -> StringId {
+    self.eq.unwrap_or_else(|| {
+      let eq = self.alloc("Pure.eq");
+      *self.eq.insert(eq)
+    })
+  }
+
+  fn mk_eq(&mut self, a: TermId, b: TermId) -> TermId {
+    let ty = self.ctx[a].1.ty.unwrap();
+    let eq = self.mk_eq_str();
+    let ty2 = self.mk_fun(ty, TypeId::PROP);
+    let ty2 = self.mk_fun(ty, ty2);
+    let eq = self.alloc(Term::Const(eq, ty2));
+    let f = self.alloc(Term::App(eq, a));
+    self.alloc(Term::App(f, b))
+  }
+
+  fn union<I: BitSetIdx<'a>, D>(&mut self, s1: I, s2: I) -> I
+  where
+    CheckerCtx<'a>: std::ops::Index<I, Output = (IdxBitSet<I::Elem>, D)>,
+  {
+    if s1 == I::EMPTY || s1 == s2 {
       s2
-    } else if s2 == SortsId::NONE {
+    } else if s2 == I::EMPTY {
       s1
     } else {
       let mut sorts = self.ctx[s1].0.clone();
@@ -666,19 +777,54 @@ impl<'a> Checker<'a> {
           let hyp = self.alloc(concl);
           CProof { shyps, hyps: self.alloc(IdxBitSet::single(hyp)), concl }
         }
-        Proof::ImpIntr(_, _) => todo!(),
-        Proof::ImpElim(_, _) => todo!(),
+        Proof::ImpIntr(t, p) => {
+          let CProof { mut shyps, hyps, mut concl } = self.ctx[m.proofs[p].unwrap()].0;
+          let t = t.intern(self, &mut m, &tr.ctx);
+          let mut hyps = self.ctx[hyps].0.clone();
+          let TermData { sorts, ty, .. } = self.ctx[t].1;
+          assert_eq!(ty, Ok(TypeId::PROP));
+          shyps = self.union(shyps, sorts);
+          hyps.remove(self.alloc(t));
+          concl = self.mk_imp(t, concl);
+          CProof { shyps, hyps: self.alloc(hyps), concl }
+        }
+        Proof::ImpElim(p, q) => {
+          let CProof { shyps: shyps1, hyps: hyps1, concl } = self.ctx[m.proofs[p].unwrap()].0;
+          let CProof { shyps: shyps2, hyps: hyps2, concl: lhs2 } = self.ctx[m.proofs[q].unwrap()].0;
+          let shyps = self.union(shyps1, shyps2);
+          let hyps = self.union(hyps1, hyps2);
+          let (lhs, concl) = self.dest_imp(concl);
+          Comparer::new(AConv).apply(self, lhs, lhs2);
+          CProof { shyps, hyps, concl }
+        }
         Proof::ForallIntr(_, _) => todo!(),
-        Proof::ForallElim(_, _) => todo!(),
+        Proof::ForallElim(p, t) => {
+          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[p].unwrap()].0;
+          let t = t.intern(self, &mut m, &tr.ctx);
+          let (ty2, pred) = self.dest_forall(concl);
+          let TermData { sorts, ty, .. } = self.ctx[t].1;
+          assert_eq!(ty, Ok(ty2));
+          let shyps = self.union(shyps, sorts);
+          let concl = if let Term::Abs(_, _, body) = self.ctx[pred].0 {
+            SubstBound::new(&[t]).apply(self, body, 0)
+          } else {
+            self.alloc(Term::App(pred, t))
+          };
+          CProof { shyps, hyps, concl }
+        }
         Proof::Axiom(name, concl, src) => {
           let name = name.intern(self, &mut m, &tr.ctx);
           let concl = concl.intern(self, &mut m, &tr.ctx);
           let shyps = self.ctx[concl].1.sorts;
           println!("axiom {} / {src:?}: {:?}", self.pp(name), self.pp(concl));
-          CProof { shyps, hyps: HypsId::ZERO, concl }
+          CProof { shyps, hyps: HypsId::EMPTY, concl }
         }
         Proof::Oracle(_, _) => todo!(),
-        Proof::Refl(_) => todo!(),
+        Proof::Refl(t) => {
+          let t = t.intern(self, &mut m, &tr.ctx);
+          let concl = self.mk_eq(t, t);
+          CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
+        }
         Proof::Symm(_) => todo!(),
         Proof::Trans(_, _) => todo!(),
         Proof::BetaNorm(_) => todo!(),
@@ -716,34 +862,32 @@ impl<'a> Checker<'a> {
           let mut inst = Mapper::new(InstTerm::new(
             args.tysubst.iter().map(|x| x.intern(self, &mut m, &tr.ctx)).collect(),
             args.subst.iter().map(|x| x.intern(self, &mut m, &tr.ctx)).collect(),
+            false,
           ));
           let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[p].unwrap()].0;
           for &(_, _, ty) in &inst.f.ty.f.subst {
-            shyps = self.union_sorts(shyps, self.ctx[ty].1.sorts);
+            shyps = self.union(shyps, self.ctx[ty].1.sorts);
           }
           for &(_, _, tm) in &inst.f.subst {
-            shyps = self.union_sorts(shyps, self.ctx[tm].1.sorts);
+            shyps = self.union(shyps, self.ctx[tm].1.sorts);
           }
           CProof { shyps, hyps, concl: inst.apply(self, concl) }
         }
         Proof::Trivial => todo!(),
         Proof::OfClass(ty, c) => {
-          if self.ofclass_cache.is_none() {
+          let OfClassCache { itself, type_ } = self.ofclass_cache.unwrap_or_else(|| {
             let itself = self.alloc("itself");
-            let prop = self.alloc("prop");
-            let prop = self.alloc(Type::Type(prop, &[]));
             let type_ = self.alloc("Pure.type");
-            self.ofclass_cache = Some(OfClassCache { itself, type_, prop })
-          }
-          let OfClassCache { itself, type_, prop } = self.ofclass_cache.unwrap();
+            *self.ofclass_cache.insert(OfClassCache { itself, type_ })
+          });
           let c = self.alloc_copy(&&*format!("{}_class", tr.ctx.strings[c]));
           let ty = ty.intern(self, &mut m, &tr.ctx);
           let itself_t = self.alloc_copy(&Type::Type(itself, &[ty]));
-          let cty = self.mk_fun(itself_t, prop);
+          let cty = self.mk_fun(itself_t, TypeId::PROP);
           let c = self.alloc(Term::Const(c, cty));
           let ty2 = self.alloc(Term::Const(type_, itself_t));
           let concl: TermId = self.alloc(Term::App(c, ty2));
-          CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::ZERO, concl }
+          CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
         }
         Proof::Thm(_i) => todo!(),
         Proof::ConstrainThm(ref args, _i) => {
@@ -773,22 +917,68 @@ impl<'a> Checker<'a> {
           CProof { shyps, hyps, concl: inst.apply(self, concl) }
         }
         Proof::LegacyFreezeT(_) => todo!(),
-        Proof::Lift(_, _, _) => todo!(),
+        Proof::Lift(gprop, inc, p) => {
+          let gprop = gprop.intern(self, &mut m, &tr.ctx);
+          let CProof { mut shyps, hyps, mut concl } = self.ctx[m.proofs[p].unwrap()].0;
+          shyps = self.union(shyps, self.ctx[gprop].1.sorts);
+          let mut lift = LiftVars::new(self, gprop, inc);
+          let mut spine = vec![];
+          while let Some((e1, e2)) = self.try_dest_imp(concl) {
+            let f = self.dest_app(self.dest_app(concl).0).0;
+            let e1 = lift.apply_spine(self, e1);
+            spine.push(self.alloc(Term::App(f, e1)));
+            concl = e2
+          }
+          concl = lift.apply_spine(self, concl);
+          for &e in spine.iter().rev() {
+            concl = self.alloc(Term::App(e, concl))
+          }
+          CProof { shyps, hyps, concl }
+        }
         Proof::IncrIndexes(_, _) => todo!(),
         Proof::Assumption(_, _) => todo!(),
         Proof::EqAssumption(_) => todo!(),
         Proof::Rotate(_, _, _) => todo!(),
         Proof::PermutePrems(_, _, _) => todo!(),
-        Proof::Bicompose(_, _, _) => todo!(),
+        Proof::Bicompose(ref args, p, q) => {
+          let CProof { shyps: shyps1, hyps: hyps1, concl } = self.ctx[m.proofs[p].unwrap()].0;
+          let CProof { shyps: shyps2, hyps: hyps2, concl: lhs2 } = self.ctx[m.proofs[q].unwrap()].0;
+          let mut inst = Mapper::new(InstTerm::new(
+            args.env.tysubst.iter().map(|x| x.intern(self, &mut m, &tr.ctx)).collect(),
+            args.env.subst.iter().map(|x| x.intern(self, &mut m, &tr.ctx)).collect(),
+            true,
+          ));
+          let mut shyps = self.union(shyps1, shyps2);
+          for (_, _, ty) in inst.f.ty.f.subst {
+            shyps = self.union(shyps, self.ctx[ty].1.sorts)
+          }
+          let hyps = self.union(hyps1, hyps2);
+          let (lhs, concl) = self.dest_imp(concl);
+          Comparer::new(AConv).apply(self, lhs, lhs2);
+          CProof { shyps, hyps, concl }
+        }
       };
+      // println!(
+      //   "{pf:?} => {:?}, {:?} |- {:?}",
+      //   self.pp(pf2.shyps),
+      //   self.pp(pf2.hyps),
+      //   self.pp(pf2.concl)
+      // );
       m.proofs[i].get_or_insert(self.alloc(pf2));
     }
     let CProof { shyps, hyps, concl } = self.ctx[m.proofs[tr.root].unwrap()].0;
+    // println!(
+    //   "want: {:?},\ngot: {:?}, {:?} |- {:?}",
+    //   self.pp(prop),
+    //   self.pp(shyps),
+    //   self.pp(hyps),
+    //   self.pp(concl)
+    // );
     let mut compare = Comparer::new(CompareTypes::new(StripSorts));
     let mut inst_var = Mapper::new(MapTypes::new(InstTVars::new(
       tr.unconstrain_var_map.iter().map(|a| a.intern(self, &mut m, &tr.ctx)).collect(),
     )));
-    if tr.unconstrain_shyps != 0 || shyps != SortsId::NONE {
+    if tr.unconstrain_shyps != 0 || shyps != SortsId::EMPTY {
       let mut classes = HashMap::<IndexNameId, IdxBitSet<ClassId>>::new();
       for _ in 0..tr.unconstrain_shyps {
         let (arg, rest) = self.dest_imp(prop);
@@ -811,7 +1001,7 @@ impl<'a> Checker<'a> {
         }
       }
     }
-    if hyps != HypsId::ZERO || !tr.unconstrain_hyps.is_empty() {
+    if hyps != HypsId::EMPTY || !tr.unconstrain_hyps.is_empty() {
       let mut hyps = self.ctx[hyps].0.clone();
       for &h in &tr.unconstrain_hyps {
         let h = h.intern(self, &mut m, &tr.ctx);
@@ -868,7 +1058,7 @@ impl<F: Map<TermId>> Mapper<TermId, F> {
     }
   }
   fn apply_hyps(&mut self, ck: &mut Checker<'_>, hs: HypsId) -> HypsId {
-    if hs == HypsId::ZERO {
+    if hs == HypsId::EMPTY {
       return hs;
     }
     let mut hs2 = IdxBitSet::new();
@@ -876,6 +1066,50 @@ impl<F: Map<TermId>> Mapper<TermId, F> {
       hs2.insert(self.apply_hyp(ck, h));
     }
     ck.alloc(hs2)
+  }
+}
+
+struct MapTypes<T>(Mapper<TypeId, T>);
+
+impl<T: Map<TypeId>> MapTypes<T> {
+  fn new(f: T) -> Self {
+    Self(Mapper::new(f))
+  }
+}
+impl<T: Map<TypeId>> Map<TermId> for MapTypes<T> {
+  fn easy(_: &mut Mapper<TermId, Self>, ck: &mut Checker<'_>, t: TermId) -> Option<TermId> {
+    if matches!(ck.ctx[t].0, Term::Bound(_)) {
+      Some(t)
+    } else {
+      None
+    }
+  }
+  fn apply(subst: &mut Mapper<TermId, Self>, ck: &mut Checker<'_>, t: TermId) -> TermId {
+    match ck.ctx[t].0 {
+      Term::Const(c, ty) => {
+        let ty2 = subst.f.0.apply(ck, ty);
+        ck.alloc(Term::Const(c, ty2))
+      }
+      Term::Free(x, ty) => {
+        let ty2 = subst.f.0.apply(ck, ty);
+        ck.alloc(Term::Free(x, ty2))
+      }
+      Term::Var(x, ty) => {
+        let ty2 = subst.f.0.apply(ck, ty);
+        ck.alloc(Term::Var(x, ty2))
+      }
+      Term::Abs(x, ty, e) => {
+        let ty2 = subst.f.0.apply(ck, ty);
+        let e2 = subst.apply(ck, e);
+        ck.alloc(Term::Abs(x, ty2, e2))
+      }
+      Term::App(t, u) => {
+        let t2 = subst.apply(ck, t);
+        let u2 = subst.apply(ck, u);
+        ck.alloc(Term::App(t2, u2))
+      }
+      Term::Bound(_) => unreachable!(),
+    }
   }
 }
 
@@ -916,6 +1150,9 @@ impl InstType {
 }
 impl Map<TypeId> for InstType {
   fn easy(inst: &mut Mapper<TypeId, Self>, ck: &mut Checker<'_>, t: TypeId) -> Option<TypeId> {
+    if inst.f.subst.is_empty() {
+      return Some(t);
+    }
     Some(match ck.ctx[t].0 {
       Type::Free(..) => t,
       Type::Var(i, s) => match inst.f.subst.binary_search_by_key(&(i, s), |x| (x.0, x.1)) {
@@ -935,14 +1172,16 @@ impl Map<TypeId> for InstType {
 struct InstTerm {
   ty: Mapper<TypeId, InstType>,
   subst: Vec<(IndexNameId, TypeId, TermId)>,
+  beta: bool,
 }
 impl InstTerm {
   fn new(
     tysubst: Vec<(IndexNameId, SortId, TypeId)>, mut subst: Vec<(IndexNameId, TypeId, TermId)>,
+    beta: bool,
   ) -> Self {
     let ty = Mapper::new(InstType::new(tysubst));
     subst.sort_by_key(|x| (x.0, x.1));
-    Self { ty, subst }
+    Self { ty, subst, beta }
   }
 }
 
@@ -977,7 +1216,19 @@ impl Map<TermId> for InstTerm {
         ck.alloc(Term::Abs(x, ty2, e2))
       }
       Term::App(t, u) => {
+        if inst.f.beta {
+          if let Term::Abs(_, _, b) = ck.ctx[t].0 {
+            let t2 = SubstBound::new(&[u]).apply(ck, b, 0);
+            return inst.apply(ck, t2);
+          }
+        }
         let t2 = inst.apply(ck, t);
+        if inst.f.beta {
+          if let Term::Abs(_, _, b) = ck.ctx[t2].0 {
+            let t2 = SubstBound::new(&[u]).apply(ck, b, 0);
+            return inst.apply(ck, t2);
+          }
+        }
         let u2 = inst.apply(ck, u);
         ck.alloc(Term::App(t2, u2))
       }
@@ -1072,6 +1323,192 @@ impl Map<TermId> for GenTerm {
   }
 }
 
+struct IncrBound {
+  map: HashMap<(TermId, u32, u32), TermId>,
+}
+impl IncrBound {
+  fn new() -> Self {
+    Self { map: HashMap::new() }
+  }
+}
+
+impl IncrBound {
+  fn apply0(&mut self, ck: &mut Checker<'_>, t: TermId, inc: u32) -> TermId {
+    if inc == 0 {
+      t
+    } else {
+      self.apply(ck, t, inc, 0)
+    }
+  }
+
+  fn apply(&mut self, ck: &mut Checker<'_>, t: TermId, inc: u32, depth: u32) -> TermId {
+    if let Some(&t) = self.map.get(&(t, inc, depth)) {
+      return t;
+    }
+    let ret = match ck.ctx[t].0 {
+      Term::Abs(x, ty, e) => {
+        let e2 = self.apply(ck, e, inc, depth + 1);
+        ck.alloc(Term::Abs(x, ty, e2))
+      }
+      Term::App(t, u) => {
+        let t2 = self.apply(ck, t, inc, depth);
+        let u2 = self.apply(ck, u, inc, depth);
+        ck.alloc(Term::App(t2, u2))
+      }
+      Term::Bound(i) if i >= depth => ck.alloc(Term::Bound(i + inc)),
+      _ => t,
+    };
+    self.map.insert((t, inc, depth), ret);
+    ret
+  }
+}
+
+struct SubstBound<'a> {
+  subst: &'a [TermId],
+  inc: IncrBound,
+  map: HashMap<(TermId, u32), TermId>,
+}
+impl<'a> SubstBound<'a> {
+  fn new(subst: &'a [TermId]) -> Self {
+    Self { subst, inc: IncrBound::new(), map: HashMap::new() }
+  }
+}
+
+impl SubstBound<'_> {
+  fn apply(&mut self, ck: &mut Checker<'_>, t: TermId, depth: u32) -> TermId {
+    if let Some(&t) = self.map.get(&(t, depth)) {
+      return t;
+    }
+    let ret = match ck.ctx[t].0 {
+      Term::Abs(x, ty, e) => {
+        let e2 = self.apply(ck, e, depth + 1);
+        ck.alloc(Term::Abs(x, ty, e2))
+      }
+      Term::App(t, u) => {
+        let t2 = self.apply(ck, t, depth);
+        let u2 = self.apply(ck, u, depth);
+        ck.alloc(Term::App(t2, u2))
+      }
+      Term::Bound(i) if i >= depth => {
+        if let Some(&t) = self.subst.get((i - depth) as usize) {
+          self.inc.apply0(ck, t, depth)
+        } else {
+          ck.alloc(Term::Bound(i - self.subst.len() as u32))
+        }
+      }
+      _ => t,
+    };
+    self.map.insert((t, depth), ret);
+    ret
+  }
+}
+
+struct LiftVarsT {
+  inc: u32,
+}
+impl Map<TypeId> for LiftVarsT {
+  fn easy(inst: &mut Mapper<TypeId, Self>, ck: &mut Checker<'_>, t: TypeId) -> Option<TypeId> {
+    Some(match ck.ctx[t].0 {
+      Type::Var(x, s) => {
+        let (x, i) = ck.ctx[x].0;
+        let x = ck.alloc((x, i + inst.f.inc));
+        ck.alloc(Type::Var(x, s))
+      }
+      Type::Free(..) => t,
+      _ if ck.ctx[t].1.maxidx == MaxIdx::NONE => t,
+      _ => return None,
+    })
+  }
+  fn apply(inst: &mut Mapper<TypeId, Self>, ck: &mut Checker<'_>, t: TypeId) -> TypeId {
+    let Type::Type(c, tys) = ck.ctx[t].0 else { unreachable!() };
+    let tys = tys.iter().map(|&t| inst.apply(ck, t)).collect::<Vec<_>>();
+    ck.alloc_copy(&Type::Type(c, &tys))
+  }
+}
+
+struct LiftVars {
+  spine: Vec<TermId>,
+  tys: Vec<TypeId>,
+  lift: Mapper<TypeId, LiftVarsT>,
+  map: HashMap<(TermId, u32), TermId>,
+}
+impl LiftVars {
+  fn new(ck: &Checker<'_>, mut gprop: TermId, inc: u32) -> Self {
+    let mut spine = vec![];
+    let mut tys = vec![];
+    loop {
+      if let Some((_, e2)) = ck.try_dest_imp(gprop) {
+        spine.push(gprop);
+        gprop = e2
+      } else {
+        let Some((_, e)) = ck.try_dest_forall(gprop) else { break };
+        let Term::Abs(_, ty, b) = ck.ctx[e].0 else { break };
+        spine.push(gprop);
+        tys.push(ty);
+        gprop = b
+      }
+    }
+    Self { spine, tys, lift: Mapper::new(LiftVarsT { inc }), map: HashMap::new() }
+  }
+}
+
+impl LiftVars {
+  fn apply_spine(&mut self, ck: &mut Checker<'_>, t: TermId) -> TermId {
+    let mut t2 = self.apply(ck, t, 0);
+    for &t in self.spine.iter().rev() {
+      let (f, e2) = ck.dest_app(t);
+      match ck.ctx[f].0 {
+        Term::Const(..) => {
+          let Term::Abs(x, ty, _) = ck.ctx[e2].0 else { unreachable!() };
+          let t = ck.alloc(Term::Abs(x, ty, t2));
+          t2 = ck.alloc(Term::App(f, t));
+        }
+        Term::App(..) => t2 = ck.alloc(Term::App(f, t2)),
+        _ => unreachable!(),
+      }
+    }
+    t2
+  }
+
+  fn apply(&mut self, ck: &mut Checker<'_>, t: TermId, depth: u32) -> TermId {
+    if let Some(&t) = self.map.get(&(t, depth)) {
+      return t;
+    }
+    let ret = match ck.ctx[t].0 {
+      Term::Var(x, ty) => {
+        let mut ty2 = self.lift.apply(ck, ty);
+        for &ty in self.tys.iter().rev() {
+          ty2 = ck.mk_fun(ty, ty2)
+        }
+        let (x, i) = ck.ctx[x].0;
+        let x = ck.alloc((x, i + self.lift.f.inc));
+        let mut t2 = ck.alloc(Term::Var(x, ty2));
+        for i in (depth..depth + self.tys.len() as u32).rev() {
+          let bv = ck.alloc(Term::Bound(i));
+          t2 = ck.alloc(Term::App(t2, bv))
+        }
+        t2
+      }
+      Term::Free(x, ty) => {
+        let ty2 = self.lift.apply(ck, ty);
+        ck.alloc(Term::Free(x, ty2))
+      }
+      Term::Abs(x, ty, e) => {
+        let e2 = self.apply(ck, e, depth + 1);
+        ck.alloc(Term::Abs(x, ty, e2))
+      }
+      Term::App(t, u) => {
+        let t2 = self.apply(ck, t, depth);
+        let u2 = self.apply(ck, u, depth);
+        ck.alloc(Term::App(t2, u2))
+      }
+      _ => t,
+    };
+    self.map.insert((t, depth), ret);
+    ret
+  }
+}
+
 struct Varify {
   subst: Vec<(StringId, SortId, TypeId)>,
 }
@@ -1098,50 +1535,6 @@ impl Map<TypeId> for Varify {
     let Type::Type(c, tys) = ck.ctx[t].0 else { unreachable!() };
     let tys = tys.iter().map(|&t| subst.apply(ck, t)).collect::<Vec<_>>();
     ck.alloc_copy(&Type::Type(c, &tys))
-  }
-}
-
-struct MapTypes<T>(Mapper<TypeId, T>);
-
-impl<T: Map<TypeId>> MapTypes<T> {
-  fn new(f: T) -> Self {
-    Self(Mapper::new(f))
-  }
-}
-impl<T: Map<TypeId>> Map<TermId> for MapTypes<T> {
-  fn easy(_: &mut Mapper<TermId, MapTypes<T>>, ck: &mut Checker<'_>, t: TermId) -> Option<TermId> {
-    if matches!(ck.ctx[t].0, Term::Bound(_)) {
-      Some(t)
-    } else {
-      None
-    }
-  }
-  fn apply(subst: &mut Mapper<TermId, MapTypes<T>>, ck: &mut Checker<'_>, t: TermId) -> TermId {
-    match ck.ctx[t].0 {
-      Term::Const(c, ty) => {
-        let ty2 = subst.f.0.apply(ck, ty);
-        ck.alloc(Term::Const(c, ty2))
-      }
-      Term::Free(x, ty) => {
-        let ty2 = subst.f.0.apply(ck, ty);
-        ck.alloc(Term::Free(x, ty2))
-      }
-      Term::Var(x, ty) => {
-        let ty2 = subst.f.0.apply(ck, ty);
-        ck.alloc(Term::Var(x, ty2))
-      }
-      Term::Abs(x, ty, e) => {
-        let ty2 = subst.f.0.apply(ck, ty);
-        let e2 = subst.apply(ck, e);
-        ck.alloc(Term::Abs(x, ty2, e2))
-      }
-      Term::App(t, u) => {
-        let t2 = subst.apply(ck, t);
-        let u2 = subst.apply(ck, u);
-        ck.alloc(Term::App(t2, u2))
-      }
-      Term::Bound(_) => unreachable!(),
-    }
   }
 }
 
@@ -1197,14 +1590,10 @@ impl<T: Compare<TypeId>> CompareTypes<T> {
   }
 }
 impl<T: Compare<TypeId>> Compare<TermId> for CompareTypes<T> {
-  fn easy(
-    _: &mut Comparer<TermId, CompareTypes<T>>, ck: &mut Checker<'_>, t1: TermId, t2: TermId,
-  ) -> bool {
+  fn easy(_: &mut Comparer<TermId, Self>, ck: &mut Checker<'_>, t1: TermId, t2: TermId) -> bool {
     t1 == t2 && matches!(ck.ctx[t1].0, Term::Bound(_))
   }
-  fn apply(
-    subst: &mut Comparer<TermId, CompareTypes<T>>, ck: &mut Checker<'_>, t1: TermId, t2: TermId,
-  ) {
+  fn apply(subst: &mut Comparer<TermId, Self>, ck: &mut Checker<'_>, t1: TermId, t2: TermId) {
     match (&ck.ctx[t1].0, &ck.ctx[t2].0) {
       (&Term::Const(c1, ty1), &Term::Const(c2, ty2)) if c1 == c2 => subst.f.0.apply(ck, ty1, ty2),
       (&Term::Free(x1, ty1), &Term::Free(x2, ty2)) if x1 == x2 => subst.f.0.apply(ck, ty1, ty2),
@@ -1232,6 +1621,25 @@ impl Compare<TypeId> for StripSorts {
       (&Type::Free(x1, _), &Type::Free(x2, SortId::TOP)) if x1 == x2 => {}
       (&Type::Var(x1, _), &Type::Var(x2, SortId::TOP)) if x1 == x2 => {}
       _ => panic!("type mismatch"),
+    }
+  }
+}
+
+struct AConv;
+impl Compare<TermId> for AConv {
+  fn easy(_: &mut Comparer<TermId, Self>, _: &mut Checker<'_>, t1: TermId, t2: TermId) -> bool {
+    t1 == t2
+  }
+  fn apply(subst: &mut Comparer<TermId, Self>, ck: &mut Checker<'_>, t1: TermId, t2: TermId) {
+    match (&ck.ctx[t1].0, &ck.ctx[t2].0) {
+      (&Term::Abs(_x1, ty1, e1), &Term::Abs(_x2, ty2, e2)) if ty1 == ty2 => {
+        subst.apply(ck, e1, e2);
+      }
+      (&Term::App(t1, u1), &Term::App(t2, u2)) => {
+        subst.apply(ck, t1, t2);
+        subst.apply(ck, u1, u2);
+      }
+      _ => panic!("term mismatch"),
     }
   }
 }

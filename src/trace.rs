@@ -56,7 +56,7 @@ impl Parse<'_> for Term {
   }
 }
 
-#[derive(Copy, Clone, Debug, DebugPls)]
+#[derive(Copy, Clone, Debug, DebugPls, PartialEq, Eq)]
 pub struct MaxIdx(pub u32);
 
 impl MaxIdx {
@@ -78,16 +78,15 @@ impl Parse<'_> for MaxIdx {
 }
 
 #[derive(Debug, DebugPls)]
-pub struct Env {
-  maxidx: MaxIdx,
-  tenv: Box<[(StringId, u32, TypeId, TermId)]>,
-  tyenv: Box<[(StringId, u32, SortId, TypeId)]>,
+pub struct Subst {
+  pub tysubst: Box<[(IndexNameId, SortId, TypeId)]>,
+  pub subst: Box<[(IndexNameId, TypeId, TermId)]>,
 }
 
-impl Parse<'_> for Env {
+impl Parse<'_> for Subst {
   fn parse_v2(t: &Tree<'_>) -> Self {
-    let (maxidx, tenv, tyenv) = <_>::parse_v2(t);
-    Self { maxidx, tenv, tyenv }
+    let (tysubst, subst) = <_>::parse_v2(t);
+    Self { tysubst, subst }
   }
 }
 
@@ -101,12 +100,6 @@ pub struct GeneralizeArgs {
 }
 
 #[derive(Debug, DebugPls)]
-pub struct InstantiateArgs {
-  pub tysubst: Box<[(IndexNameId, SortId, TypeId)]>,
-  pub subst: Box<[(IndexNameId, TypeId, TermId)]>,
-}
-
-#[derive(Debug, DebugPls)]
 pub struct ConstrainArgs {
   pub shyps: Box<[SortId]>,
   pub hyps: Box<[TermId]>,
@@ -115,13 +108,12 @@ pub struct ConstrainArgs {
 
 #[derive(Debug, DebugPls)]
 pub struct BicomposeArgs {
-  pub env: Env,
-  pub smax: MaxIdx,
+  pub env: Subst,
+  pub tpairs: Box<[(TermId, TermId)]>,
+  pub nsubgoal: u32,
   pub flatten: bool,
-  pub bs: Box<[TermId]>,
   pub as_: Box<[TermId]>,
   pub a_: Option<TermId>,
-  pub old_as: Box<[TermId]>,
   pub n: u32,
   pub nlift: u32,
 }
@@ -164,9 +156,9 @@ pub enum Proof {
   AppRule(ProofId, ProofId),
   EqIntr(ProofId, ProofId),
   EqElim(ProofId, ProofId),
-  FlexFlex(Box<Env>, ProofId),
+  FlexFlex(Box<Subst>, ProofId),
   Generalize(Box<GeneralizeArgs>, ProofId),
-  Instantiate(Box<InstantiateArgs>, ProofId),
+  Instantiate(Box<Subst>, ProofId),
   Trivial,
   OfClass(TypeId, StringId),
   Thm(ThmId),
@@ -217,7 +209,7 @@ impl Parse<'_> for Proof {
         <_>::parse_v2(p),
       ),
       (b"N", [a, b, p]) => Self::Instantiate(
-        Box::new(InstantiateArgs { tysubst: <_>::parse_v2(a), subst: <_>::parse_v2(b) }),
+        Box::new(Subst { tysubst: <_>::parse_v2(a), subst: <_>::parse_v2(b) }),
         <_>::parse_v2(p),
       ),
       (b"t", []) => Self::Trivial,
@@ -239,15 +231,14 @@ impl Parse<'_> for Proof {
       (b"q", [p]) => Self::EqAssumption(<_>::parse_v2(p)),
       (b"R", [a, b, p]) => Self::Rotate(<_>::parse_v2(a), <_>::parse_v2(b), <_>::parse_v2(p)),
       (b"P", [a, b, p]) => Self::PermutePrems(<_>::parse_v2(a), <_>::parse_v2(b), <_>::parse_v2(p)),
-      (b"C", [env, smax, flatten, bs, as_, a_, old_as, n, nlift, p, q]) => Self::Bicompose(
+      (b"C", [env, tpairs, nsubgoal, flatten, as_, a_, n, nlift, p, q]) => Self::Bicompose(
         Box::new(BicomposeArgs {
           env: <_>::parse_v2(env),
-          smax: <_>::parse_v2(smax),
+          tpairs: <_>::parse_v2(tpairs),
+          nsubgoal: <_>::parse_v2(nsubgoal),
           flatten: <_>::parse_v2(flatten),
-          bs: <_>::parse_v2(bs),
           as_: <_>::parse_v2(as_),
           a_: <_>::parse_v2(a_),
-          old_as: <_>::parse_v2(old_as),
           n: <_>::parse_v2(n),
           nlift: <_>::parse_v2(nlift),
         }),

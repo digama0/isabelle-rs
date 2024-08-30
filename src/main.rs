@@ -1,3 +1,4 @@
+#![allow(unused)]
 use ast::Entry;
 use itertools::Itertools;
 use kernel::Checker;
@@ -893,6 +894,7 @@ enum AxiomReason {
   Def { unchecked: bool, overloaded: bool },
   ClassRel,
   Arity,
+  Typedef,
 }
 impl<'a> Parse<'a> for AxiomReason {
   fn parse1(t: &Tree<'a>) -> Self {
@@ -907,6 +909,7 @@ impl<'a> Parse<'a> for AxiomReason {
       }
       4 => Self::ClassRel,
       5 => Self::Arity,
+      6 => Self::Typedef,
       _ => panic!(),
     }
   }
@@ -1062,6 +1065,7 @@ struct LocaleDepEntry {
   target: String,
   prefix: Vec<(String, bool)>,
   subst_types: Vec<((String, Sort), Box<Type>)>,
+  #[allow(clippy::type_complexity)]
   subst_terms: Vec<((String, Box<Type>), Box<Term>)>,
 }
 impl<'a> Parse<'a> for LocaleDepEntry {
