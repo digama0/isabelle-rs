@@ -8,17 +8,17 @@ use dbg_pls::{pretty, DebugPls};
 use ref_cast::RefCast;
 
 use crate::{
+  binparser::{BinParse, BinParser, TagPtr},
   idx::{Idx, IdxBitSet, IdxVec},
   mk_id,
   trace::{
-    self, AssumptionId, Context, IndexNameId, MaxIdx, Proof, ProofId, SortId, StringId, Term,
-    TermId, ThmTrace, TypeId,
+    self, proof, AssumptionId, ClassId, HasBinParse, IdMapping, IndexNameId, MaxIdx, Proof,
+    ProofId, SortId, StringId, Subst, Term, TermId, ThmTrace, TypeId,
   },
   Global,
 };
 
 mk_id! {
-  ClassId(u32),
   HypId(u32),
   HypsId(u32),
   SortsId(u32),
@@ -45,6 +45,21 @@ pub enum Type<'a> {
   Type(StringId, &'a [TypeId]),
   Free(StringId, SortId),
   Var(IndexNameId, SortId),
+}
+impl<'a> BinParse<'_, BM<'a, '_>> for Type<'a> {
+  fn parse(ctx: &mut BM<'a, '_>, bp: &BinParser<'_>, p: TagPtr) -> Self {
+    match bp.get_enum(p) {
+      (0, &[x, s]) => Self::Free(bp.parse(ctx, x), bp.parse(ctx, s)),
+      (1, &[i, s]) => Self::Var(bp.parse(ctx, i), bp.parse(ctx, s)),
+      (2, &[s, tys]) => Self::Type(bp.parse(ctx, s), bp.parse(ctx, tys)),
+      _ => panic!(),
+    }
+  }
+}
+impl<'a, 'b, 'c, T: BinParse<'c, BM<'a, 'b>>> BinParse<'c, BM<'a, 'b>> for &'a [T] {
+  fn parse(ctx: &mut BM<'a, 'b>, bp: &BinParser<'c>, p: TagPtr) -> Self {
+    ctx.0.alloc.alloc_slice_fill_iter(bp.parse_list(p).map(|a| bp.parse(ctx, a)))
+  }
 }
 
 impl<'a> Type<'a> {
@@ -114,15 +129,9 @@ macro_rules! mk_checker_ctx {
     struct CheckerCtx<$a> {
       $($field: Lookup<$id, $cty, $d>,)*
     }
+    #[derive(Default)]
     struct Mapping {
-      $($($field: IdxVec<$id, Option<$id>>, $($reg)?)?)*
-    }
-    impl Mapping {
-      fn empty(ctx: &Context) -> Self {
-        Self {
-          $($($field: IdxVec::from_default(ctx.$field.len()), $($reg)?)?)*
-        }
-      }
+      $($($field: HashMap<TagPtr, $id>, $($reg)?)?)*
     }
     $(
       impl<$a> HasAccessors<CheckerCtx<$a>> for $id {
@@ -143,23 +152,10 @@ macro_rules! mk_checker_ctx {
         fn index(&self, i: $id) -> &Self::Output { &self.$field.0[i] }
       }
       $(
-        impl<'a> Internable<'a> for $id {
-          type Output = $id;
-          fn intern(&'a self, ck: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> $id {
-            <Self as Mappable<'a>>::intern(*self, ck, m, ctx)
-          }
+        impl HasMapping for $id {
+          fn get(m: &Mapping) -> &HashMap<TagPtr, $id> { &m.$field }
+          fn get_mut(m: &mut Mapping) -> &mut HashMap<TagPtr, $id> { &mut m.$field }
         }
-        impl HasAccessors<Mapping> for $id {
-          type Val = Option<$id>;
-          fn get(m: &Mapping) -> &IdxVec<Self, Self::Val> { &m.$field }
-          fn get_mut(m: &mut Mapping) -> &mut IdxVec<Self, Self::Val> { &mut m.$field }
-        }
-        impl HasAccessors<Context> for $id {
-          type Val = $tty;
-          fn get(m: &Context) -> &IdxVec<Self, Self::Val> { &m.$field }
-          fn get_mut(m: &mut Context) -> &mut IdxVec<Self, Self::Val> { &mut m.$field }
-        }
-        impl Mappable<'_> for $id {}
       $($reg)?)?
     )*
   };
@@ -176,13 +172,36 @@ mk_checker_ctx! {
     assumptions: AssumptionId => ((ProofId, u32), (ProofId, u32), ()) reg,
     hyps: HypId => ((), TermId, ())
       (data |ck, k| ck.check_hyp(*k)),
-    classes: ClassId => ((), StringId, ()),
+    classes: ClassId => (StringId, StringId, ()) reg,
     hypss: HypsId => ((), IdxBitSet<HypId>, ()),
     sortss: SortsId => ((), IdxBitSet<SortId>, ()),
     lctxs: LCtxId => ((), LCtx, ()),
   }
 }
 
+type BM<'a, 'b> = (&'b mut Checker<'a>, &'b mut Mapping);
+impl<'a, 'b> IdMapping for BM<'a, 'b> {}
+
+impl<'a> BinParse<'_, BM<'a, '_>> for &'a str {
+  fn parse(ctx: &mut BM<'a, '_>, bp: &BinParser<'_>, p: TagPtr) -> Self {
+    ctx.0.alloc.alloc_str(std::str::from_utf8(bp.get(p.as_ptr()).as_str()).unwrap())
+  }
+}
+
+impl<'a> BinParse<'_, BM<'a, '_>> for IdxBitSet<ClassId> {
+  fn parse(ctx: &mut BM<'a, '_>, bp: &BinParser<'_>, p: TagPtr) -> Self {
+    let mut out = IdxBitSet::new();
+    for a in bp.parse_list(p) {
+      out.insert(bp.parse(ctx, a));
+    }
+    out
+  }
+}
+
+trait HasMapping: Idx {
+  fn get(_: &Mapping) -> &HashMap<TagPtr, Self>;
+  fn get_mut(_: &mut Mapping) -> &mut HashMap<TagPtr, Self>;
+}
 trait HasAccessors<T>: Idx {
   type Val;
   fn get(_: &T) -> &IdxVec<Self, Self::Val>;
@@ -194,19 +213,19 @@ trait HasAlloc<'a>: HasAccessors<CheckerCtx<'a>, Val = (Self::Key, Self::Data)> 
   fn get_alloc<'b>(cc: &'b mut CheckerCtx<'a>) -> &'b mut Lookup<Self, Self::Key, Self::Data>;
   fn mk_data(ck: &mut Checker<'a>, k: &Self::Key) -> Self::Data;
 }
-trait Mappable<'a>:
-  HasAccessors<Mapping, Val = Option<Self>> + HasAlloc<'a> + HasAccessors<Context> + 'a
+
+impl<'a, 'b, I> HasBinParse<I> for BM<'a, 'b>
+where
+  I: HasMapping + HasAlloc<'a> + 'a,
+  for<'c> <I as HasAlloc<'a>>::Key: BinParse<'c, BM<'a, 'b>>,
 {
-  fn intern(self, ck: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self
-  where
-    <Self as HasAccessors<Context>>::Val: Internable<'a, Output = <Self as HasAlloc<'a>>::Key> + 'a,
-  {
-    match Self::get(m)[self] {
-      Some(i) => i,
+  fn parse(&mut self, bp: &BinParser<'_>, p: TagPtr) -> I {
+    match HasMapping::get(self.1).get(&p) {
+      Some(&i) => i,
       None => {
-        let val = Self::get(ctx)[self].intern(ck, m, ctx);
-        let i = ck.alloc(val);
-        Self::get_mut(m)[self] = Some(i);
+        let val = BinParse::parse(self, bp, p);
+        let i = self.0.alloc(val);
+        HasMapping::get_mut(self.1).insert(p, i);
         i
       }
     }
@@ -216,103 +235,6 @@ trait Mappable<'a>:
 trait BitSetIdx<'a>: HasAlloc<'a, Key = IdxBitSet<Self::Elem>> {
   const EMPTY: Self;
   type Elem: Idx;
-}
-
-trait Internable<'a> {
-  type Output: Sized + 'a;
-  fn intern(&'a self, cc: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self::Output;
-}
-impl<'a> Internable<'a> for String {
-  type Output = &'a str;
-  fn intern(&'a self, _: &mut Checker<'a>, _: &mut Mapping, _: &Context) -> Self::Output {
-    self
-  }
-}
-impl Internable<'_> for u32 {
-  type Output = Self;
-  fn intern(&self, _: &mut Checker<'_>, _: &mut Mapping, _: &Context) -> Self::Output {
-    *self
-  }
-}
-impl<'a, T: Internable<'a>> Internable<'a> for [T] {
-  type Output = &'a [T::Output];
-  fn intern(&'a self, ck: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self::Output {
-    ck.alloc.alloc_slice_fill_iter(self.iter().map(|i| i.intern(ck, m, ctx)))
-  }
-}
-impl<'a, T: Internable<'a>> Internable<'a> for Vec<T> {
-  type Output = &'a [T::Output];
-  fn intern(&'a self, ck: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self::Output {
-    (**self).intern(ck, m, ctx)
-  }
-}
-impl<'a, A: Internable<'a>, B: Internable<'a>> Internable<'a> for (A, B) {
-  type Output = (A::Output, B::Output);
-  fn intern(&'a self, ck: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self::Output {
-    (self.0.intern(ck, m, ctx), self.1.intern(ck, m, ctx))
-  }
-}
-impl<'a, A: Internable<'a>, B: Internable<'a>, C: Internable<'a>> Internable<'a> for (A, B, C) {
-  type Output = (A::Output, B::Output, C::Output);
-  fn intern(&'a self, ck: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self::Output {
-    (self.0.intern(ck, m, ctx), self.1.intern(ck, m, ctx), self.2.intern(ck, m, ctx))
-  }
-}
-impl<'a, A: Internable<'a>, B: Internable<'a>, C: Internable<'a>, D: Internable<'a>> Internable<'a>
-  for (A, B, C, D)
-{
-  type Output = (A::Output, B::Output, C::Output, D::Output);
-  fn intern(&'a self, ck: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self::Output {
-    (
-      self.0.intern(ck, m, ctx),
-      self.1.intern(ck, m, ctx),
-      self.2.intern(ck, m, ctx),
-      self.3.intern(ck, m, ctx),
-    )
-  }
-}
-impl<'a> Internable<'a> for trace::Type {
-  type Output = Type<'a>;
-  fn intern(&'a self, ck: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self::Output {
-    match self {
-      trace::Type::Type(a, b) => Type::Type(a.intern(ck, m, ctx), b.intern(ck, m, ctx)),
-      trace::Type::Free(a, b) => Type::Free(a.intern(ck, m, ctx), b.intern(ck, m, ctx)),
-      trace::Type::Var(a, b) => Type::Var(a.intern(ck, m, ctx), b.intern(ck, m, ctx)),
-    }
-  }
-}
-impl<'a> Internable<'a> for Term {
-  type Output = Term;
-  fn intern(&'a self, ck: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self::Output {
-    match self {
-      Term::Const(a, b) => Term::Const(a.intern(ck, m, ctx), b.intern(ck, m, ctx)),
-      Term::Free(a, b) => Term::Free(a.intern(ck, m, ctx), b.intern(ck, m, ctx)),
-      Term::Var(a, b) => Term::Var(a.intern(ck, m, ctx), b.intern(ck, m, ctx)),
-      Term::Bound(a) => Term::Bound(*a),
-      Term::Abs(a, b, c) => {
-        Term::Abs(a.intern(ck, m, ctx), b.intern(ck, m, ctx), c.intern(ck, m, ctx))
-      }
-      Term::App(a, b) => Term::App(a.intern(ck, m, ctx), b.intern(ck, m, ctx)),
-    }
-  }
-}
-impl<'a> Internable<'a> for Proof {
-  type Output = CProof;
-  fn intern(&'a self, _: &mut Checker<'a>, _: &mut Mapping, _: &'a Context) -> Self::Output {
-    panic!("impl Internable for Proof")
-  }
-}
-
-impl<'a> Internable<'a> for trace::Sorts {
-  type Output = IdxBitSet<ClassId>;
-  fn intern(&'a self, ck: &mut Checker<'a>, m: &mut Mapping, ctx: &'a Context) -> Self::Output {
-    let mut out = IdxBitSet::new();
-    for &c in &self.0 {
-      let c = c.intern(ck, m, ctx);
-      out.insert(ck.alloc(c));
-    }
-    out
-  }
 }
 
 trait Treeify {
@@ -763,23 +685,41 @@ impl<'a> Checker<'a> {
     assert!(data.maxidx.0 == 0 && self.ctx[data.ty.unwrap()].0.as_type().0 == StringId::PROP);
   }
 
-  pub fn check(&mut self, tr: &'a ThmTrace) {
-    let mut m = Mapping::empty(&tr.ctx);
-    println!("{}", pretty(tr));
-    let trace::Header { prop, .. } = tr.header;
-    let mut prop = prop.intern(self, &mut m, &tr.ctx);
-    for (i, pf) in tr.ctx.proofs.enum_iter() {
-      let pf2 = match *pf {
-        Proof::Sorry | Proof::Pruned => panic!("encountered Sorry / Pruned"),
-        Proof::Hyp(concl) => {
-          let concl = concl.intern(self, &mut m, &tr.ctx);
+  fn parse<'b, 'c, T: BinParse<'b, BM<'a, 'c>>>(
+    &'c mut self, m: &'c mut Mapping, bp: &BinParser<'b>, p: TagPtr,
+  ) -> T {
+    T::parse(&mut (self, m), bp, p)
+  }
+
+  pub fn check(&mut self, bp: &BinParser<'_>, tr: TagPtr) {
+    let mut m = Mapping::default();
+    let tr: ThmTrace = self.parse(&mut m, bp, tr);
+    println!(
+      "proof_trace/{} = {}.{}",
+      tr.header.serial, self.ctx.strings.0[tr.header.thm_name.name].0, tr.header.thm_name.i,
+    );
+    println!("{}", pretty(&tr));
+    let trace::Header { mut prop, .. } = tr.header;
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![tr.root];
+    while let Some(p) = stack.pop() {
+      if visited.insert(p) {
+        stack.extend(proof::subproofs(bp, p))
+      }
+    }
+    for pf in visited {
+      #[allow(non_upper_case_globals)]
+      let pf2 = match bp.get_enum(pf) {
+        (proof::Sorry | proof::Pruned, _) => panic!("encountered Sorry / Pruned"),
+        (proof::Hyp, &[concl]) => {
+          let concl: TermId = self.parse(&mut m, bp, concl);
           let shyps = self.ctx[concl].1.sorts;
           let hyp = self.alloc(concl);
           CProof { shyps, hyps: self.alloc(IdxBitSet::single(hyp)), concl }
         }
-        Proof::ImpIntr(t, p) => {
-          let CProof { mut shyps, hyps, mut concl } = self.ctx[m.proofs[p].unwrap()].0;
-          let t = t.intern(self, &mut m, &tr.ctx);
+        (proof::ImpIntr, &[t, p]) => {
+          let CProof { mut shyps, hyps, mut concl } = self.ctx[m.proofs[&p]].0;
+          let t: TermId = self.parse(&mut m, bp, t);
           let mut hyps = self.ctx[hyps].0.clone();
           let TermData { sorts, ty, .. } = self.ctx[t].1;
           assert_eq!(ty, Ok(TypeId::PROP));
@@ -788,19 +728,19 @@ impl<'a> Checker<'a> {
           concl = self.mk_imp(t, concl);
           CProof { shyps, hyps: self.alloc(hyps), concl }
         }
-        Proof::ImpElim(p, q) => {
-          let CProof { shyps: shyps1, hyps: hyps1, concl } = self.ctx[m.proofs[p].unwrap()].0;
-          let CProof { shyps: shyps2, hyps: hyps2, concl: lhs2 } = self.ctx[m.proofs[q].unwrap()].0;
+        (proof::ImpElim, &[p, q]) => {
+          let CProof { shyps: shyps1, hyps: hyps1, concl } = self.ctx[m.proofs[&p]].0;
+          let CProof { shyps: shyps2, hyps: hyps2, concl: lhs2 } = self.ctx[m.proofs[&q]].0;
           let shyps = self.union(shyps1, shyps2);
           let hyps = self.union(hyps1, hyps2);
           let (lhs, concl) = self.dest_imp(concl);
           Comparer::new(AConv).apply(self, lhs, lhs2);
           CProof { shyps, hyps, concl }
         }
-        Proof::ForallIntr(_, _) => todo!(),
-        Proof::ForallElim(p, t) => {
-          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[p].unwrap()].0;
-          let t = t.intern(self, &mut m, &tr.ctx);
+        (proof::ForallIntr, &[_, _]) => todo!(),
+        (proof::ForallElim, &[t, p]) => {
+          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
+          let t: TermId = self.parse(&mut m, bp, t);
           let (ty2, pred) = self.dest_forall(concl);
           let TermData { sorts, ty, .. } = self.ctx[t].1;
           assert_eq!(ty, Ok(ty2));
@@ -812,59 +752,58 @@ impl<'a> Checker<'a> {
           };
           CProof { shyps, hyps, concl }
         }
-        Proof::Axiom(name, concl, src) => {
-          let name = name.intern(self, &mut m, &tr.ctx);
-          let concl = concl.intern(self, &mut m, &tr.ctx);
+        (proof::Axiom, &[name, concl, src]) => {
+          let name: StringId = self.parse(&mut m, bp, name);
+          let concl: TermId = self.parse(&mut m, bp, concl);
           let shyps = self.ctx[concl].1.sorts;
           println!("axiom {} / {src:?}: {:?}", self.pp(name), self.pp(concl));
           CProof { shyps, hyps: HypsId::EMPTY, concl }
         }
-        Proof::Oracle(_, _) => todo!(),
-        Proof::Refl(t) => {
-          let t = t.intern(self, &mut m, &tr.ctx);
+        (proof::Oracle, &[_, _]) => todo!(),
+        (proof::Refl, &[t]) => {
+          let t = self.parse(&mut m, bp, t);
           let concl = self.mk_eq(t, t);
           CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
         }
-        Proof::Symm(_) => todo!(),
-        Proof::Trans(_, _) => todo!(),
-        Proof::BetaNorm(_) => todo!(),
-        Proof::BetaHead(_) => todo!(),
-        Proof::Eta(_) => todo!(),
-        Proof::EtaLong(_) => todo!(),
-        Proof::StripSHyps(ref sorts, p) => {
-          let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[p].unwrap()].0;
-          if !sorts.is_empty() {
+        (proof::Symm, &[_]) => todo!(),
+        (proof::Trans, &[_, _]) => todo!(),
+        (proof::BetaNorm, &[_]) => todo!(),
+        (proof::BetaHead, &[_]) => todo!(),
+        (proof::Eta, &[_]) => todo!(),
+        (proof::EtaLong, &[_]) => todo!(),
+        (proof::StripSHyps, &[sorts, p]) => {
+          let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
+          if sorts != TagPtr::ZERO {
             let mut newsorts = self.ctx[shyps].0.clone();
-            for &s in sorts {
-              let s = s.intern(self, &mut m, &tr.ctx);
-              newsorts.remove(s);
+            for s in bp.parse_list(sorts) {
+              newsorts.remove(self.parse(&mut m, bp, s));
             }
             newsorts.0.shrink_to_fit();
             shyps = self.alloc(newsorts);
           }
           CProof { shyps, hyps, concl }
         }
-        Proof::AbsRule(_, _) => todo!(),
-        Proof::AppRule(_, _) => todo!(),
-        Proof::EqIntr(_, _) => todo!(),
-        Proof::EqElim(_, _) => todo!(),
-        Proof::FlexFlex(_, _) => todo!(),
-        Proof::Generalize(ref args, p) => {
+        (proof::AbsRule, &[_, _]) => todo!(),
+        (proof::AppRule, &[_, _]) => todo!(),
+        (proof::EqIntr, &[_, _]) => todo!(),
+        (proof::EqElim, &[_, _]) => todo!(),
+        (proof::FlexFlex, &[_, _]) => todo!(),
+        (proof::Generalize, &[tfrees, frees, idx, p]) => {
           let mut inst = Mapper::new(GenTerm::new(
-            args.tfrees.iter().map(|x| x.intern(self, &mut m, &tr.ctx)).collect(),
-            args.frees.iter().map(|x| x.intern(self, &mut m, &tr.ctx)).collect(),
-            args.idx,
+            self.parse(&mut m, bp, tfrees),
+            self.parse(&mut m, bp, frees),
+            self.parse(&mut m, bp, idx),
           ));
-          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[p].unwrap()].0;
+          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
           CProof { shyps, hyps, concl: inst.apply(self, concl) }
         }
-        Proof::Instantiate(ref args, p) => {
+        (proof::Instantiate, &[tysubst, subst, p]) => {
           let mut inst = Mapper::new(InstTerm::new(
-            args.tysubst.iter().map(|x| x.intern(self, &mut m, &tr.ctx)).collect(),
-            args.subst.iter().map(|x| x.intern(self, &mut m, &tr.ctx)).collect(),
+            self.parse(&mut m, bp, tysubst),
+            self.parse(&mut m, bp, subst),
             false,
           ));
-          let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[p].unwrap()].0;
+          let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
           for &(_, _, ty) in &inst.f.ty.f.subst {
             shyps = self.union(shyps, self.ctx[ty].1.sorts);
           }
@@ -873,15 +812,18 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps, concl: inst.apply(self, concl) }
         }
-        Proof::Trivial => todo!(),
-        Proof::OfClass(ty, c) => {
+        (proof::Trivial, &[]) => todo!(),
+        (proof::OfClass, &[ty, c]) => {
           let OfClassCache { itself, type_ } = self.ofclass_cache.unwrap_or_else(|| {
             let itself = self.alloc("itself");
             let type_ = self.alloc("Pure.type");
             *self.ofclass_cache.insert(OfClassCache { itself, type_ })
           });
-          let c = self.alloc_copy(&&*format!("{}_class", tr.ctx.strings[c]));
-          let ty = ty.intern(self, &mut m, &tr.ctx);
+          let c = self.alloc_copy(&&*format!(
+            "{}_class",
+            std::str::from_utf8(bp.get(c.as_ptr()).as_str()).unwrap()
+          ));
+          let ty = self.parse(&mut m, bp, ty);
           let itself_t = self.alloc_copy(&Type::Type(itself, &[ty]));
           let cty = self.mk_fun(itself_t, TypeId::PROP);
           let c = self.alloc(Term::Const(c, cty));
@@ -889,37 +831,38 @@ impl<'a> Checker<'a> {
           let concl: TermId = self.alloc(Term::App(c, ty2));
           CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
         }
-        Proof::Thm(_i) => todo!(),
-        Proof::ConstrainThm(ref args, _i) => {
-          let mut shyps = IdxBitSet::new();
-          for &s in &args.shyps {
-            shyps.insert(s.intern(self, &mut m, &tr.ctx));
+        (proof::Thm, &[_i]) => todo!(),
+        (proof::ConstrainThm, &[_i, shyps, hyps, prop]) => {
+          let mut bits = IdxBitSet::new();
+          for s in bp.parse_list(shyps) {
+            bits.insert(self.parse(&mut m, bp, s));
           }
-          let shyps = self.alloc(shyps);
-          let mut hyps = IdxBitSet::new();
-          for &h in &args.hyps {
-            let h = h.intern(self, &mut m, &tr.ctx);
-            hyps.insert(self.alloc(h));
+          let shyps = self.alloc(bits);
+          let mut bits = IdxBitSet::new();
+          for h in bp.parse_list(hyps) {
+            let h = self.parse(&mut m, bp, h);
+            bits.insert(self.alloc(h));
           }
-          let hyps = self.alloc(hyps);
-          CProof { shyps, hyps, concl: args.prop.intern(self, &mut m, &tr.ctx) }
+          let hyps = self.alloc(bits);
+          CProof { shyps, hyps, concl: self.parse(&mut m, bp, prop) }
         }
-        Proof::Varify(ref args, p) => {
-          let subst = args
-            .iter()
+        (proof::Varify, &[args, p]) => {
+          let mut subst = bp
+            .parse_list(args)
             .map(|x| {
-              let (a, b, c, d) = x.intern(self, &mut m, &tr.ctx);
+              let ((a, b), (c, d)) = self.parse(&mut m, bp, x);
               (a, b, self.alloc(Type::Var(c, d)))
             })
             .collect();
           let mut inst = Mapper::new(MapTypes::new(Varify::new(subst)));
-          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[p].unwrap()].0;
+          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
           CProof { shyps, hyps, concl: inst.apply(self, concl) }
         }
-        Proof::LegacyFreezeT(_) => todo!(),
-        Proof::Lift(gprop, inc, p) => {
-          let gprop = gprop.intern(self, &mut m, &tr.ctx);
-          let CProof { mut shyps, hyps, mut concl } = self.ctx[m.proofs[p].unwrap()].0;
+        (proof::LegacyFreezeT, &[_]) => todo!(),
+        (proof::Lift, &[gprop, inc, p]) => {
+          let gprop: TermId = self.parse(&mut m, bp, gprop);
+          let inc = self.parse(&mut m, bp, inc);
+          let CProof { mut shyps, hyps, mut concl } = self.ctx[m.proofs[&p]].0;
           shyps = self.union(shyps, self.ctx[gprop].1.sorts);
           let mut lift = LiftVars::new(self, gprop, inc);
           let mut spine = vec![];
@@ -935,19 +878,16 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps, concl }
         }
-        Proof::IncrIndexes(_, _) => todo!(),
-        Proof::Assumption(_, _) => todo!(),
-        Proof::EqAssumption(_) => todo!(),
-        Proof::Rotate(_, _, _) => todo!(),
-        Proof::PermutePrems(_, _, _) => todo!(),
-        Proof::Bicompose(ref args, p, q) => {
-          let CProof { shyps: shyps1, hyps: hyps1, concl } = self.ctx[m.proofs[p].unwrap()].0;
-          let CProof { shyps: shyps2, hyps: hyps2, concl: lhs2 } = self.ctx[m.proofs[q].unwrap()].0;
-          let mut inst = Mapper::new(InstTerm::new(
-            args.env.tysubst.iter().map(|x| x.intern(self, &mut m, &tr.ctx)).collect(),
-            args.env.subst.iter().map(|x| x.intern(self, &mut m, &tr.ctx)).collect(),
-            true,
-          ));
+        (proof::IncrIndexes, &[_, _]) => todo!(),
+        (proof::Assumption, &[_, _]) => todo!(),
+        (proof::EqAssumption, &[_]) => todo!(),
+        (proof::Rotate, &[_, _, _]) => todo!(),
+        (proof::PermutePrems, &[_, _, _]) => todo!(),
+        (proof::Bicompose, &[env, tpairs, nsubgoal, flatten, as_, a_, n, nlift, p, q]) => {
+          let CProof { shyps: shyps1, hyps: hyps1, concl } = self.ctx[m.proofs[&p]].0;
+          let CProof { shyps: shyps2, hyps: hyps2, concl: lhs2 } = self.ctx[m.proofs[&q]].0;
+          let (tysubst, subst) = self.parse(&mut m, bp, env);
+          let mut inst = Mapper::new(InstTerm::new(tysubst, subst, true));
           let mut shyps = self.union(shyps1, shyps2);
           for (_, _, ty) in inst.f.ty.f.subst {
             shyps = self.union(shyps, self.ctx[ty].1.sorts)
@@ -957,6 +897,7 @@ impl<'a> Checker<'a> {
           Comparer::new(AConv).apply(self, lhs, lhs2);
           CProof { shyps, hyps, concl }
         }
+        _ => panic!(),
       };
       // println!(
       //   "{pf:?} => {:?}, {:?} |- {:?}",
@@ -964,9 +905,9 @@ impl<'a> Checker<'a> {
       //   self.pp(pf2.hyps),
       //   self.pp(pf2.concl)
       // );
-      m.proofs[i].get_or_insert(self.alloc(pf2));
+      m.proofs.insert(pf, self.alloc(pf2));
     }
-    let CProof { shyps, hyps, concl } = self.ctx[m.proofs[tr.root].unwrap()].0;
+    let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&tr.root]].0;
     // println!(
     //   "want: {:?},\ngot: {:?}, {:?} |- {:?}",
     //   self.pp(prop),
@@ -975,9 +916,7 @@ impl<'a> Checker<'a> {
     //   self.pp(concl)
     // );
     let mut compare = Comparer::new(CompareTypes::new(StripSorts));
-    let mut inst_var = Mapper::new(MapTypes::new(InstTVars::new(
-      tr.unconstrain_var_map.iter().map(|a| a.intern(self, &mut m, &tr.ctx)).collect(),
-    )));
+    let mut inst_var = Mapper::new(MapTypes::new(InstTVars::new(tr.unconstrain_var_map)));
     if tr.unconstrain_shyps != 0 || shyps != SortsId::EMPTY {
       let mut classes = HashMap::<IndexNameId, IdxBitSet<ClassId>>::new();
       for _ in 0..tr.unconstrain_shyps {
@@ -1004,7 +943,6 @@ impl<'a> Checker<'a> {
     if hyps != HypsId::EMPTY || !tr.unconstrain_hyps.is_empty() {
       let mut hyps = self.ctx[hyps].0.clone();
       for &h in &tr.unconstrain_hyps {
-        let h = h.intern(self, &mut m, &tr.ctx);
         hyps.remove(self.alloc(h));
         let (arg, rest) = self.dest_imp(prop);
         let h = inst_var.apply(self, h);

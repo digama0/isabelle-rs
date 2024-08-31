@@ -1,15 +1,19 @@
 #![allow(unused)]
+use aligned_vec::{ABox, AVec, ConstAlign};
 use ast::Entry;
+use binparser::BinParser;
 use itertools::Itertools;
 use kernel::Checker;
 use lalrpop_util::lalrpop_mod;
 use rusqlite::{Connection, Result};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use trace::ThmTrace;
 
 pub mod ast;
+pub mod binparser;
 pub mod idx;
 pub mod kernel;
 pub mod trace;
@@ -24,7 +28,7 @@ enum Tree<'a> {
 impl<'a> std::fmt::Debug for Tree<'a> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
-      Self::Text(s) => write!(f, "{:?}", std::str::from_utf8(s).unwrap()),
+      Self::Text(s) => write!(f, "{:?}", String::from_utf8_lossy(s)),
       Self::Elem(name, attrs, ts) => {
         write!(f, "{}", std::str::from_utf8(name).unwrap())?;
         if !attrs.is_empty() {
@@ -55,6 +59,7 @@ type Trees<'a> = Box<[Tree<'a>]>;
 
 const X: u8 = 5;
 const Y: u8 = 6;
+const Z: u8 = 7;
 
 #[derive(Clone)]
 struct Separated<'a, const N: u8>(Option<&'a [u8]>);
@@ -166,6 +171,28 @@ fn parse(bytes: &[u8]) -> Trees<'_> {
   }
   assert!(stack.is_empty() && markup.is_none());
   head.into()
+}
+
+fn unescape(mut bytes: &[u8]) -> Box<[u32]> {
+  let mut out = AVec::<u8, ConstAlign<4>>::new(4);
+  while let Some(i) = memchr::memchr(Z, bytes) {
+    out.extend_from_slice(&bytes[..i]);
+    out.push(match bytes.get(i + 1) {
+      Some(0) => X,
+      Some(1) => Y,
+      Some(&Z) => Z,
+      _ => panic!("bad escape"),
+    });
+    bytes = &bytes[i + 2..]
+  }
+  out.extend_from_slice(bytes);
+  let out = out.into_boxed_slice();
+  // assert!(out.len() % 4 == 0);
+  unsafe {
+    let ptr = ABox::into_raw_parts(out).0;
+    let ptr = std::ptr::slice_from_raw_parts_mut(ptr as *mut u32, ptr.len() / 4);
+    Box::from_raw(ptr)
+  }
 }
 
 trait Parse<'a>: Sized {
@@ -1151,13 +1178,14 @@ struct Axiom {
 #[derive(Default)]
 pub struct Global {
   proofs: HashMap<u32, ProofBox>,
-  traces: HashMap<u32, ThmTrace>,
+  traces: HashMap<u32, Box<[u32]>>,
   axioms: HashMap<String, Axiom>,
 }
 
 impl Global {
   fn load_session(&mut self, sess: &'static str, proofs: bool) -> Result<Box<Session>> {
-    let path = format!("/home/mario/.isabelle/heaps/polyml-5.9.1_x86_64_32-linux/log/{sess}.db");
+    let path =
+      format!("/home/mario/.isabelle/heaps/polyml-exportSmall_x86_64_32-linux/log/{sess}.db");
     let file = Path::new(&path);
     assert!(file.exists(), "could not find {:?}", sess);
     let db = Connection::open(file)?;
@@ -1184,6 +1212,17 @@ impl Global {
         Datatypes(&'a str),
         Other(&'a str, &'a str),
       }
+      let blob = || -> Result<_> {
+        let blob = row.get_ref(5)?.as_blob()?;
+        if row.get(4)? {
+          let mut out = vec![];
+          let reader = std::io::Cursor::new(blob);
+          zstd::stream::Decoder::new(reader).unwrap().read_to_end(&mut out).unwrap();
+          Ok(Cow::Owned(out))
+        } else {
+          Ok(Cow::Borrowed(blob))
+        }
+      };
       let name = {
         let s = row.get_ref(2)?.as_str()?;
         if let Some(s) = s.strip_prefix("proofs/") {
@@ -1216,7 +1255,7 @@ impl Global {
               "theory/typedefs" => RowType::TypeDefs(theory),
               "theory/datatypes" => RowType::Datatypes(theory),
               "theory/parents" => {
-                for s in std::str::from_utf8(row.get_ref(5)?.as_blob()?).unwrap().lines() {
+                for s in std::str::from_utf8(&blob()?).unwrap().lines() {
                   data.parents.push(s.trim().to_owned())
                 }
                 continue;
@@ -1226,23 +1265,15 @@ impl Global {
           }
         }
       };
-      let mut out;
-      let blob = row.get_ref(5)?.as_blob()?;
-      let blob = if row.get(4)? {
-        out = vec![];
-        let reader = std::io::Cursor::new(blob);
-        zstd::stream::Decoder::new(reader).unwrap().read_to_end(&mut out).unwrap();
-        &out
-      } else {
-        blob
-      };
-      let blob = parse(blob);
+      let blob = blob()?;
+      let blob = parse(&blob);
       match name {
         RowType::Proof(i) => {
           self.proofs.insert(i, ProofBox::parse(&blob));
         }
         RowType::Trace(i) => {
-          self.traces.insert(i, ThmTrace::parse_v2(&Tree::Node(blob)));
+          let [Tree::Text(blob)] = *blob else { panic!() };
+          self.traces.insert(i, unescape(blob));
         }
         RowType::Types(theory) => data.types.push((theory.to_owned(), <_>::parse(&blob))),
         RowType::Consts(theory) => data.consts.push((theory.to_owned(), <_>::parse(&blob))),
@@ -1441,23 +1472,23 @@ fn main() -> Result<()> {
     let mut reachable: HashSet<u32> = Default::default();
     while let Some(i) = queue.pop() {
       if reachable.insert(i) {
-        for pr in &g.traces[&i].ctx.proofs.0 {
-          if let &trace::Proof::Thm(j) = pr {
-            if !gthms.contains_key(&j) {
-              match uses.entry(j) {
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                  if let Uses::Once = *e.get() {
-                    e.insert(Uses::Multiple);
-                  }
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                  e.insert(Uses::Once);
-                }
-              }
-              queue.push(j)
-            }
-          }
-        }
+        // for pr in &g.traces[&i].ctx.proofs.0 {
+        //   if let &trace::Proof::Thm(j) = pr {
+        //     if !gthms.contains_key(&j) {
+        //       match uses.entry(j) {
+        //         std::collections::hash_map::Entry::Occupied(mut e) => {
+        //           if let Uses::Once = *e.get() {
+        //             e.insert(Uses::Multiple);
+        //           }
+        //         }
+        //         std::collections::hash_map::Entry::Vacant(e) => {
+        //           e.insert(Uses::Once);
+        //         }
+        //       }
+        //       queue.push(j)
+        //     }
+        //   }
+        // }
       }
     }
   }
@@ -1489,14 +1520,8 @@ fn main() -> Result<()> {
   let mut v = uses.iter().filter(|x| !matches!(x.1, Uses::Once)).map(|x| *x.0).collect::<Vec<_>>();
   v.sort();
   for i in v {
-    let p = &g.traces[&i];
-    println!(
-      "proof_trace/{i} = {:?}.{} -> {:?}",
-      p.ctx.strings[p.header.thm_name.name],
-      p.header.thm_name.i,
-      uses.get(&i),
-    );
-    Checker::new(&bumpalo::Bump::new(), &g).check(p);
+    let (p, root) = BinParser::new(&g.traces[&i]);
+    Checker::new(&bumpalo::Bump::new(), &g).check(&p, root);
   }
   // for (i, p) in &g.traces {
   //   p.root.0.thm_name.name

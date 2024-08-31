@@ -399,6 +399,14 @@ macro_rules! mk_id {
           Self(<&str>::parse_v2(t).parse().unwrap())
         }
       }
+      // impl<'a> $crate::binparser::BinParse<'a> for $id {
+      //   fn parse1(t: &$crate::Tree<'a>) -> Self {
+      //     Self(<&str>::parse1(t).parse().unwrap())
+      //   }
+      //   fn parse_v2(t: &$crate::Tree<'a>) -> Self {
+      //     Self(<&str>::parse_v2(t).parse().unwrap())
+      //   }
+      // }
     )*
   };
 }
