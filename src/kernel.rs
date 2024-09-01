@@ -12,8 +12,8 @@ use crate::{
   idx::{Idx, IdxBitSet, IdxVec},
   mk_id,
   trace::{
-    self, proof, AssumptionId, ClassId, HasBinParse, IdMapping, IndexNameId, MaxIdx, Proof,
-    ProofId, SortId, StringId, Subst, Term, TermId, ThmTrace, TypeId,
+    self, proof, AssumptionId, BicomposeArgs, ClassId, HasBinParse, IdMapping, IndexNameId, MaxIdx,
+    Proof, ProofId, SortId, StringId, Subst, Term, TermId, ThmTrace, TypeId,
   },
   Global,
 };
@@ -799,8 +799,7 @@ impl<'a> Checker<'a> {
         }
         (proof::Instantiate, &[tysubst, subst, p]) => {
           let mut inst = Mapper::new(InstTerm::new(
-            self.parse(&mut m, bp, tysubst),
-            self.parse(&mut m, bp, subst),
+            Subst::from_assoc(&mut (&mut *self, &mut m), bp, tysubst, subst),
             false,
           ));
           let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
@@ -883,11 +882,11 @@ impl<'a> Checker<'a> {
         (proof::EqAssumption, &[_]) => todo!(),
         (proof::Rotate, &[_, _, _]) => todo!(),
         (proof::PermutePrems, &[_, _, _]) => todo!(),
-        (proof::Bicompose, &[env, tpairs, nsubgoal, flatten, as_, a_, n, nlift, p, q]) => {
+        (proof::Bicompose, &[args, p, q]) => {
+          let args: BicomposeArgs = self.parse(&mut m, bp, args);
           let CProof { shyps: shyps1, hyps: hyps1, concl } = self.ctx[m.proofs[&p]].0;
           let CProof { shyps: shyps2, hyps: hyps2, concl: lhs2 } = self.ctx[m.proofs[&q]].0;
-          let (tysubst, subst) = self.parse(&mut m, bp, env);
-          let mut inst = Mapper::new(InstTerm::new(tysubst, subst, true));
+          let mut inst = Mapper::new(InstTerm::new(args.env, true));
           let mut shyps = self.union(shyps1, shyps2);
           for (_, _, ty) in inst.f.ty.f.subst {
             shyps = self.union(shyps, self.ctx[ty].1.sorts)
@@ -1078,10 +1077,10 @@ impl Map<TypeId> for InstTVars {
 }
 
 struct InstType {
-  subst: Vec<(IndexNameId, SortId, TypeId)>,
+  subst: Box<[(IndexNameId, SortId, TypeId)]>,
 }
 impl InstType {
-  fn new(mut subst: Vec<(IndexNameId, SortId, TypeId)>) -> Self {
+  fn new(mut subst: Box<[(IndexNameId, SortId, TypeId)]>) -> Self {
     subst.sort_by_key(|x| (x.0, x.1));
     Self { subst }
   }
@@ -1109,17 +1108,14 @@ impl Map<TypeId> for InstType {
 
 struct InstTerm {
   ty: Mapper<TypeId, InstType>,
-  subst: Vec<(IndexNameId, TypeId, TermId)>,
+  subst: Box<[(IndexNameId, TypeId, TermId)]>,
   beta: bool,
 }
 impl InstTerm {
-  fn new(
-    tysubst: Vec<(IndexNameId, SortId, TypeId)>, mut subst: Vec<(IndexNameId, TypeId, TermId)>,
-    beta: bool,
-  ) -> Self {
-    let ty = Mapper::new(InstType::new(tysubst));
-    subst.sort_by_key(|x| (x.0, x.1));
-    Self { ty, subst, beta }
+  fn new(mut subst: Subst, beta: bool) -> Self {
+    let ty = Mapper::new(InstType::new(subst.tysubst));
+    subst.subst.sort_by_key(|x| (x.0, x.1));
+    Self { ty, subst: subst.subst, beta }
   }
 }
 

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::{
   binparser::{BinParse, BinParser, Ptr, TagPtr},
   idx::IdxVec,
@@ -97,16 +99,77 @@ impl MaxIdx {
 //   }
 // }
 
+pub struct Table<K, V>(Vec<(K, V)>);
+
+impl<'a, C, K: BinParse<'a, C>, V: BinParse<'a, C>> BinParse<'a, C> for Table<K, V> {
+  fn parse(ctx: &mut C, bp: &BinParser<'a>, p: TagPtr) -> Self {
+    fn accum<'a, C, K: BinParse<'a, C>, V: BinParse<'a, C>>(
+      ctx: &mut C, bp: &BinParser<'a>, out: &mut Vec<(K, V)>, p: TagPtr,
+    ) {
+      #![allow(non_upper_case_globals)]
+      const Branch2: u32 = 0;
+      const Branch3: u32 = 1;
+      const Empty: u32 = 2;
+      const Leaf1: u32 = 3;
+      const Leaf2: u32 = 4;
+      const Leaf3: u32 = 5;
+      const Size: u32 = 6;
+      match bp.get_enum(p) {
+        (Empty, &[]) => {}
+        (Leaf1, &[k1, v1]) => out.push((bp.parse(ctx, k1), bp.parse(ctx, v1))),
+        (Leaf2, &[kv1, kv2]) => {
+          out.push(bp.parse(ctx, kv1));
+          out.push(bp.parse(ctx, kv2))
+        }
+        (Leaf3, &[kv1, kv2, kv3]) => {
+          out.push(bp.parse(ctx, kv1));
+          out.push(bp.parse(ctx, kv2));
+          out.push(bp.parse(ctx, kv3))
+        }
+        (Branch2, &[t1, kv, t2]) => {
+          accum(ctx, bp, out, t1);
+          out.push(bp.parse(ctx, kv));
+          accum(ctx, bp, out, t2);
+        }
+        (Branch3, &[args]) => {
+          let &[t1, kv1, t2, kv2, t3] = bp.get(p.as_ptr()).as_tuple_n();
+          accum(ctx, bp, out, t1);
+          out.push(bp.parse(ctx, kv1));
+          accum(ctx, bp, out, t2);
+          out.push(bp.parse(ctx, kv2));
+          accum(ctx, bp, out, t3);
+        }
+        (Size, &[_, p]) => accum(ctx, bp, out, p),
+        _ => panic!(),
+      }
+    }
+    let mut out = vec![];
+    accum(ctx, bp, &mut out, p);
+    Table(out)
+  }
+}
+
 #[derive(Debug, DebugPls)]
 pub struct Subst {
   pub tysubst: Box<[(IndexNameId, SortId, TypeId)]>,
   pub subst: Box<[(IndexNameId, TypeId, TermId)]>,
 }
 
-impl<C: IdMapping> BinParse<'_, C> for Subst {
-  fn parse(ctx: &mut C, bp: &BinParser<'_>, p: TagPtr) -> Self {
-    let (tysubst, subst) = bp.parse(ctx, p);
-    Self { tysubst, subst }
+impl Subst {
+  pub fn from_assoc<C: IdMapping>(
+    ctx: &mut C, bp: &BinParser<'_>, tsub: TagPtr, sub: TagPtr,
+  ) -> Self {
+    Subst {
+      tysubst: bp.parse_list(tsub).map(|p| bp.parse(ctx, p)).map(|((a, b), c)| (a, b, c)).collect(),
+      subst: bp.parse_list(sub).map(|p| bp.parse(ctx, p)).map(|((a, b), c)| (a, b, c)).collect(),
+    }
+  }
+  pub fn from_env<C: IdMapping>(ctx: &mut C, bp: &BinParser<'_>, p: TagPtr) -> Self {
+    let (tenv, tyenv, _maxidx): (Table<_, _>, Table<_, _>, TagPtr) = bp.parse(ctx, p);
+    Self {
+      tysubst: tyenv.0.into_iter().map(|(a, (b, c))| (a, b, c)).collect(),
+      subst: tenv.0.into_iter().map(|(a, (b, c))| (a, b, c)).collect(),
+    }
   }
 }
 
@@ -137,6 +200,21 @@ pub struct BicomposeArgs {
   pub n: u32,
   pub nlift: u32,
 }
+impl<C: IdMapping> BinParse<'_, C> for BicomposeArgs {
+  fn parse(ctx: &mut C, bp: &BinParser<'_>, p: TagPtr) -> Self {
+    let &[env, tpairs, nsubgoal, flatten, as_, a_, n, nlift] = bp.get(p.as_ptr()).as_tuple_n();
+    Self {
+      env: Subst::from_env(ctx, bp, env),
+      tpairs: bp.parse(ctx, tpairs),
+      nsubgoal: bp.parse(ctx, nsubgoal),
+      flatten: bp.parse(ctx, flatten),
+      as_: bp.parse(ctx, as_),
+      a_: bp.parse(ctx, a_),
+      n: bp.parse(ctx, n),
+      nlift: bp.parse(ctx, nlift),
+    }
+  }
+}
 
 #[derive(Clone, Copy, Debug, DebugPls)]
 pub enum AxiomSource {
@@ -161,7 +239,7 @@ pub enum Proof {
   ImpIntr(TermId, ProofId),
   ImpElim(ProofId, ProofId),
   ForallIntr(TermId, ProofId),
-  ForallElim(ProofId, TermId),
+  ForallElim(TermId, ProofId),
   Axiom(StringId, TermId, AxiomSource),
   Oracle(StringId, TermId),
   Refl(TermId),
@@ -187,8 +265,8 @@ pub enum Proof {
   LegacyFreezeT(ProofId),
   Lift(TermId, u32, ProofId),
   IncrIndexes(u32, ProofId),
-  Assumption(AssumptionId, u32),
-  EqAssumption(AssumptionId),
+  Assumption(u32, u32, ProofId),
+  EqAssumption(u32, ProofId),
   Rotate(u32, u32, ProofId),
   PermutePrems(u32, u32, ProofId),
   Bicompose(Box<BicomposeArgs>, ProofId, ProofId),
@@ -239,9 +317,8 @@ pub mod proof {
 
   pub const END: u32 = 37;
 
-  pub fn subproofs<'a>(bp: &BinParser<'a>, p: ProofPtr) -> &'a [ProofPtr] {
-    let (tag, args) = bp.get_enum(p);
-    let i = match tag {
+  pub fn num_subproofs(tag: u32) -> usize {
+    match tag {
       Sorry | Hyp | Axiom | Oracle | Refl | BetaNorm | BetaHead | Eta | EtaLong | Trivial
       | OfClass | Thm | ConstrainThm | Pruned => 0,
       ImpIntr | ForallIntr | ForallElim | Symm | StripSHyps | AbsRule | FlexFlex | Generalize
@@ -249,8 +326,12 @@ pub mod proof {
       | Rotate | PermutePrems => 1,
       ImpElim | Trans | AppRule | EqIntr | EqElim | Bicompose => 2,
       END.. => panic!(),
-    };
-    &args[args.len() - i..]
+    }
+  }
+
+  pub fn subproofs<'a>(bp: &BinParser<'a>, p: ProofPtr) -> &'a [ProofPtr] {
+    let (tag, args) = bp.get_enum(p);
+    &args[args.len() - num_subproofs(tag)..]
   }
 }
 
@@ -410,7 +491,7 @@ impl<C: IdMapping> BinParse<'_, C> for ThmTrace {
     // println!("assumptions: {assumptions:?}");
     Self {
       header: bp.parse(ctx, header),
-      root: bp.parse(ctx, root),
+      root,
       unconstrain_var_map: bp.parse(ctx, uc_var_map),
       unconstrain_shyps: bp.parse(ctx, uc_shyps),
       unconstrain_hyps: bp.parse(ctx, uc_hyps),
@@ -418,6 +499,28 @@ impl<C: IdMapping> BinParse<'_, C> for ThmTrace {
   }
 }
 
+impl ThmTrace {
+  pub fn get_uses(bp: &BinParser<'_>, p: TagPtr) -> BTreeSet<u32> {
+    let &[_, _, _, _, root] = bp.get(p.as_ptr()).as_tuple_n();
+    let mut visited = BTreeSet::new();
+    let mut thms = BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(p) = stack.pop() {
+      if visited.insert(p) {
+        let (tag, args) = bp.get_enum(p);
+        let i = proof::num_subproofs(tag);
+        if i == 0 {
+          if let proof::Thm | proof::ConstrainThm = tag {
+            thms.insert(args[0].as_uint());
+          }
+        } else {
+          stack.extend(&args[args.len() - i..])
+        }
+      }
+    }
+    thms
+  }
+}
 // impl Context {
 //   pub fn count_uses(&self) -> IdxVec<ProofId, u8> {
 //     let mut uses = IdxVec::<_, u8>::from_default(self.proofs.len());

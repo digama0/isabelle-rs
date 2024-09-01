@@ -130,6 +130,13 @@ impl<'a> BinParser<'a> {
     (Self { mem, ptrs }, TagPtr(root))
   }
 
+  pub fn pack(self) -> Vec<u32> {
+    self.ptrs
+  }
+  pub fn unpack(mem: &'a [u32], ptrs: Vec<u32>) -> Self {
+    Self { mem, ptrs }
+  }
+
   pub fn get(&self, p: Ptr) -> Value<'a> {
     let i = self.ptrs[p.0 as usize] as usize;
     let meta = Metadata(self.mem[i]);
@@ -155,7 +162,19 @@ impl<'a> BinParser<'a> {
     match p.unpack() {
       Obj::UInt(n) => Tree::UInt(n),
       Obj::Ptr(p) => match self.get(p) {
-        Value::Byte(bs) => Tree::Bytes(bs),
+        Value::Byte(bs) => {
+          // heuristic (lossless) string detection
+          if bs.len() >= 4 {
+            let (len, rest) = bs.split_at(4);
+            let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+            if len <= rest.len() && rest.len() < len + 4 && rest[len..].iter().all(|&x| x == 0) {
+              if let Ok(s) = std::str::from_utf8(&rest[..len]) {
+                return Tree::String(s);
+              }
+            }
+          }
+          Tree::Bytes(bs)
+        }
         Value::Tuple(ps) => Tree::Tuple(ps.iter().map(|&p| self.to_tree(p)).collect()),
       },
     }
@@ -200,6 +219,7 @@ impl ExactSizeIterator for ParseList<'_> {
 pub enum Tree<'a> {
   UInt(u32),
   Bytes(&'a [u8]),
+  String(&'a str),
   Tuple(Box<[Tree<'a>]>),
 }
 
@@ -265,6 +285,12 @@ impl<'a, Cx, A: BinParse<'a, Cx>, B: BinParse<'a, Cx>, C: BinParse<'a, Cx>> BinP
 impl<'a, C> BinParse<'a, C> for u32 {
   fn parse(_: &mut C, _: &BinParser<'a>, p: TagPtr) -> Self {
     p.as_uint()
+  }
+}
+
+impl<'a, C> BinParse<'a, C> for bool {
+  fn parse(_: &mut C, _: &BinParser<'a>, p: TagPtr) -> bool {
+    p.as_uint() != 0
   }
 }
 

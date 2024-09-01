@@ -1,7 +1,7 @@
 #![allow(unused)]
 use aligned_vec::{ABox, AVec, ConstAlign};
 use ast::Entry;
-use binparser::BinParser;
+use binparser::{BinParser, TagPtr};
 use itertools::Itertools;
 use kernel::Checker;
 use lalrpop_util::lalrpop_mod;
@@ -59,7 +59,7 @@ type Trees<'a> = Box<[Tree<'a>]>;
 
 const X: u8 = 5;
 const Y: u8 = 6;
-const Z: u8 = 7;
+const Z: u8 = 251;
 
 #[derive(Clone)]
 struct Separated<'a, const N: u8>(Option<&'a [u8]>);
@@ -180,7 +180,7 @@ fn unescape(mut bytes: &[u8]) -> Box<[u32]> {
     out.push(match bytes.get(i + 1) {
       Some(0) => X,
       Some(1) => Y,
-      Some(&Z) => Z,
+      Some(2) => Z,
       _ => panic!("bad escape"),
     });
     bytes = &bytes[i + 2..]
@@ -1178,8 +1178,19 @@ struct Axiom {
 #[derive(Default)]
 pub struct Global {
   proofs: HashMap<u32, ProofBox>,
-  traces: HashMap<u32, Box<[u32]>>,
+  traces: HashMap<u32, (bool, Box<[u8]>)>,
   axioms: HashMap<String, Axiom>,
+}
+
+fn maybe_decompress(compressed: bool, blob: &[u8]) -> Cow<'_, [u8]> {
+  if compressed {
+    let mut out = vec![];
+    let reader = std::io::Cursor::new(blob);
+    zstd::stream::Decoder::new(reader).unwrap().read_to_end(&mut out).unwrap();
+    Cow::Owned(out)
+  } else {
+    Cow::Borrowed(blob)
+  }
 }
 
 impl Global {
@@ -1195,8 +1206,6 @@ impl Global {
     while let Some(row) = rows.next()? {
       #[derive(Debug)]
       enum RowType<'a> {
-        Proof(u32),
-        Trace(u32),
         Types(&'a str),
         Consts(&'a str),
         Axioms(&'a str),
@@ -1212,69 +1221,47 @@ impl Global {
         Datatypes(&'a str),
         Other(&'a str, &'a str),
       }
-      let blob = || -> Result<_> {
-        let blob = row.get_ref(5)?.as_blob()?;
-        if row.get(4)? {
-          let mut out = vec![];
-          let reader = std::io::Cursor::new(blob);
-          zstd::stream::Decoder::new(reader).unwrap().read_to_end(&mut out).unwrap();
-          Ok(Cow::Owned(out))
-        } else {
-          Ok(Cow::Borrowed(blob))
-        }
-      };
       let name = {
         let s = row.get_ref(2)?.as_str()?;
-        if let Some(s) = s.strip_prefix("proofs/") {
-          if !proofs {
-            continue;
-          }
-          RowType::Proof(s.parse().unwrap())
-        } else if let Some(s) = s.strip_prefix("proof_trace/") {
-          if !proofs {
-            continue;
-          }
-          RowType::Trace(s.parse().unwrap())
+        if let Some(s) = s.strip_prefix("proof_trace/") {
+          self.traces.insert(
+            s.parse().unwrap(),
+            (row.get(4)?, row.get_ref(5)?.as_blob()?.to_vec().into_boxed_slice()),
+          );
+          continue;
+        }
+        let theory = row.get_ref(1)?.as_str()?;
+        if let Some(s) = s.strip_prefix("theory/other/") {
+          RowType::Other(theory, s)
         } else {
-          let theory = row.get_ref(1)?.as_str()?;
-          if let Some(s) = s.strip_prefix("theory/other/") {
-            RowType::Other(theory, s)
-          } else {
-            match s {
-              "theory/types" => RowType::Types(theory),
-              "theory/consts" => RowType::Consts(theory),
-              "theory/axioms" => RowType::Axioms(theory),
-              "theory/thms" => RowType::Thms(theory),
-              "theory/classes" => RowType::Classes(theory),
-              "theory/locales" => RowType::Locales(theory),
-              "theory/locale_dependencies" => RowType::LocaleDeps(theory),
-              "theory/classrel" => RowType::ClassRels(theory),
-              "theory/arities" => RowType::Arities(theory),
-              "theory/constdefs" => RowType::ConstDefs(theory),
-              "theory/spec_rules" => RowType::SpecRules(theory),
-              "theory/typedefs" => RowType::TypeDefs(theory),
-              "theory/datatypes" => RowType::Datatypes(theory),
-              "theory/parents" => {
-                for s in std::str::from_utf8(&blob()?).unwrap().lines() {
-                  data.parents.push(s.trim().to_owned())
-                }
-                continue;
+          match s {
+            "theory/types" => RowType::Types(theory),
+            "theory/consts" => RowType::Consts(theory),
+            "theory/axioms" => RowType::Axioms(theory),
+            "theory/thms" => RowType::Thms(theory),
+            "theory/classes" => RowType::Classes(theory),
+            "theory/locales" => RowType::Locales(theory),
+            "theory/locale_dependencies" => RowType::LocaleDeps(theory),
+            "theory/classrel" => RowType::ClassRels(theory),
+            "theory/arities" => RowType::Arities(theory),
+            "theory/constdefs" => RowType::ConstDefs(theory),
+            "theory/spec_rules" => RowType::SpecRules(theory),
+            "theory/typedefs" => RowType::TypeDefs(theory),
+            "theory/datatypes" => RowType::Datatypes(theory),
+            "theory/parents" => {
+              let blob = maybe_decompress(row.get(4)?, row.get_ref(5)?.as_blob()?);
+              for s in std::str::from_utf8(&blob).unwrap().lines() {
+                data.parents.push(s.trim().to_owned())
               }
-              _ => continue,
+              continue;
             }
+            _ => continue,
           }
         }
       };
-      let blob = blob()?;
+      let blob = maybe_decompress(row.get(4)?, row.get_ref(5)?.as_blob()?);
       let blob = parse(&blob);
       match name {
-        RowType::Proof(i) => {
-          self.proofs.insert(i, ProofBox::parse(&blob));
-        }
-        RowType::Trace(i) => {
-          let [Tree::Text(blob)] = *blob else { panic!() };
-          self.traces.insert(i, unescape(blob));
-        }
         RowType::Types(theory) => data.types.push((theory.to_owned(), <_>::parse(&blob))),
         RowType::Consts(theory) => data.consts.push((theory.to_owned(), <_>::parse(&blob))),
         RowType::Axioms(theory) => data.axioms.push((theory.to_owned(), <_>::parse(&blob))),
@@ -1355,92 +1342,92 @@ fn main() -> Result<()> {
       }
     }
   }
-  for (name, sess) in parents.iter().map(|(x, y)| (*x, y)).chain(std::iter::once((main, &sess))) {
-    for (theory, entities) in &sess.types {
-      for entity in entities {
-        println!("{theory} type: {}", entity.name)
-      }
-    }
-    for (theory, entities) in &sess.consts {
-      for entity in entities {
-        println!("{theory} const: {}", entity.name)
-      }
-    }
-    for (theory, entities) in &sess.axioms {
-      for entity in entities {
-        println!("{theory} axiom: {}", entity.name);
-        if let Some(x) = &entity.val.0 {
-          println!("  = {:?}", x.1)
-        }
-      }
-    }
-    for (theory, entities) in &sess.thms {
-      for entity in entities {
-        println!("{theory} thm: {}", entity.name);
-        // if let Some(s) = g.proofs.get(&entity.serial) {
-        //   println!("=> {:#?}", s)
-        // }
-        // if let Some(s) = g.traces.get(&entity.serial) {
-        //   println!("=> {:#?}", s)
-        // }
-      }
-    }
-    for (theory, entities) in &sess.classes {
-      for entity in entities {
-        println!("{theory} class: {}", entity.name);
-        if let Some(x) = &entity.val.0 {
-          println!("  = {:?}", x)
-        } else {
-          println!("  = none")
-        }
-      }
-    }
-    for (theory, entities) in &sess.locales {
-      for entity in entities {
-        println!("{theory} locale: {}", entity.name)
-      }
-    }
-    for (theory, entities) in &sess.class_rels {
-      for entity in entities {
-        println!("{theory} class_rel: {} -> {}", entity.c1, entity.c2)
-      }
-    }
-    for (theory, entities) in &sess.arities {
-      for entity in entities {
-        println!("{theory} arity: {}", entity.type_name)
-      }
-    }
-    for (theory, kind, entities) in &sess.other {
-      for entity in entities {
-        println!("{theory} {kind}: {}", entity.name)
-      }
-    }
-    for (theory, entities) in &sess.const_defs {
-      for entity in entities {
-        println!("{theory} const_def: {}", entity.name)
-      }
-    }
-    for (theory, entities) in &sess.spec_rules {
-      for entity in entities {
-        println!("{theory} spec_rule: {}", entity.name)
-      }
-    }
-    for (theory, entities) in &sess.locale_deps {
-      for entity in entities {
-        println!("{theory} locale_dep: {}", entity.name)
-      }
-    }
-    for (theory, entities) in &sess.type_defs {
-      for entity in entities {
-        println!("{theory} type_def: {}", entity.name)
-      }
-    }
-    for (theory, entities) in &sess.datatypes {
-      for entity in entities {
-        println!("{theory} datatype: {}", entity.name)
-      }
-    }
-  }
+  // for (name, sess) in parents.iter().map(|(x, y)| (*x, y)).chain(std::iter::once((main, &sess))) {
+  //   for (theory, entities) in &sess.types {
+  //     for entity in entities {
+  //       println!("{theory} type: {}", entity.name)
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.consts {
+  //     for entity in entities {
+  //       println!("{theory} const: {}", entity.name)
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.axioms {
+  //     for entity in entities {
+  //       println!("{theory} axiom: {}", entity.name);
+  //       if let Some(x) = &entity.val.0 {
+  //         println!("  = {:?}", x.1)
+  //       }
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.thms {
+  //     for entity in entities {
+  //       println!("{theory} thm: {}", entity.name);
+  //       // if let Some(s) = g.proofs.get(&entity.serial) {
+  //       //   println!("=> {:#?}", s)
+  //       // }
+  //       // if let Some(s) = g.traces.get(&entity.serial) {
+  //       //   println!("=> {:#?}", s)
+  //       // }
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.classes {
+  //     for entity in entities {
+  //       println!("{theory} class: {}", entity.name);
+  //       if let Some(x) = &entity.val.0 {
+  //         println!("  = {:?}", x)
+  //       } else {
+  //         println!("  = none")
+  //       }
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.locales {
+  //     for entity in entities {
+  //       println!("{theory} locale: {}", entity.name)
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.class_rels {
+  //     for entity in entities {
+  //       println!("{theory} class_rel: {} -> {}", entity.c1, entity.c2)
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.arities {
+  //     for entity in entities {
+  //       println!("{theory} arity: {}", entity.type_name)
+  //     }
+  //   }
+  //   for (theory, kind, entities) in &sess.other {
+  //     for entity in entities {
+  //       println!("{theory} {kind}: {}", entity.name)
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.const_defs {
+  //     for entity in entities {
+  //       println!("{theory} const_def: {}", entity.name)
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.spec_rules {
+  //     for entity in entities {
+  //       println!("{theory} spec_rule: {}", entity.name)
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.locale_deps {
+  //     for entity in entities {
+  //       println!("{theory} locale_dep: {}", entity.name)
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.type_defs {
+  //     for entity in entities {
+  //       println!("{theory} type_def: {}", entity.name)
+  //     }
+  //   }
+  //   for (theory, entities) in &sess.datatypes {
+  //     for entity in entities {
+  //       println!("{theory} datatype: {}", entity.name)
+  //     }
+  //   }
+  // }
   let mut gthms: HashMap<u32, (usize, usize, usize)> = Default::default();
   for (i, (_, sess)) in parents.iter().enumerate() {
     for (j, (_, thms)) in sess.thms.iter().enumerate() {
@@ -1452,51 +1439,11 @@ fn main() -> Result<()> {
   // for (&i, p) in &g.proofs {
   //   println!("proofs/{i}: {p:#?}")
   // }
-  #[derive(Debug)]
-  enum Uses {
-    Once,
-    Multiple,
-    Public,
-  }
-  let mut uses: HashMap<u32, Uses> = Default::default();
-  {
-    let mut queue: Vec<u32> = vec![];
-    for (_, e) in &sess.thms {
-      for entity in e {
-        if g.traces.contains_key(&entity.serial) {
-          uses.insert(entity.serial, Uses::Public);
-          queue.push(entity.serial);
-        }
-      }
-    }
-    let mut reachable: HashSet<u32> = Default::default();
-    while let Some(i) = queue.pop() {
-      if reachable.insert(i) {
-        // for pr in &g.traces[&i].ctx.proofs.0 {
-        //   if let &trace::Proof::Thm(j) = pr {
-        //     if !gthms.contains_key(&j) {
-        //       match uses.entry(j) {
-        //         std::collections::hash_map::Entry::Occupied(mut e) => {
-        //           if let Uses::Once = *e.get() {
-        //             e.insert(Uses::Multiple);
-        //           }
-        //         }
-        //         std::collections::hash_map::Entry::Vacant(e) => {
-        //           e.insert(Uses::Once);
-        //         }
-        //       }
-        //       queue.push(j)
-        //     }
-        //   }
-        // }
-      }
-    }
-  }
   for entity in sess.axioms.iter().flat_map(|(_, x)| x) {
     match entity.val.0.as_deref() {
       None => panic!("axiom {} not exported", entity.name),
       Some((_, AxiomReason::Forgot)) => panic!("axiom missing provenance"),
-      Some((_, AxiomReason::Def { unchecked: false, overloaded: false })) => {
+      Some((_, AxiomReason::Def { unchecked: false, overloaded: _ })) => {
         // todo: definition checking
       }
       Some((_, AxiomReason::Axiom)) => {
@@ -1514,17 +1461,76 @@ fn main() -> Result<()> {
             | "Pure.combination"
         ))
       }
+      Some((_, AxiomReason::Arity)) => {
+        // println!("arity axiom {}: {:?}", entity.name, entity.val.0.as_deref().unwrap().0.prop)
+      }
+      Some((_, AxiomReason::Typedef)) => {
+        // println!("typedef axiom {}: {:?}", entity.name, entity.val.0.as_deref().unwrap().0.prop)
+      }
       Some((_, r)) => todo!("reason: {r:?}"),
     }
   }
-  let mut v = uses.iter().filter(|x| !matches!(x.1, Uses::Once)).map(|x| *x.0).collect::<Vec<_>>();
-  v.sort();
-  for i in v {
-    let (p, root) = BinParser::new(&g.traces[&i]);
-    Checker::new(&bumpalo::Bump::new(), &g).check(&p, root);
+  #[derive(Debug)]
+  enum Uses {
+    Once,
+    Multiple,
+    Public,
   }
-  // for (i, p) in &g.traces {
-  //   p.root.0.thm_name.name
-  // }
+  enum Elem {
+    Start(u32),
+    Finish(Box<(Vec<u32>, Box<[u32]>, TagPtr)>),
+  }
+  let mut reachable: HashSet<u32> = Default::default();
+  let mut uses: HashMap<u32, Uses> = Default::default();
+  let mut stack: Vec<Elem> = vec![];
+  for i in sess.thms.iter().rev().flat_map(|(_, e)| e.iter().rev()).map(|e| e.serial) {
+    if g.traces.contains_key(&i) {
+      uses.insert(i, Uses::Public);
+      if reachable.insert(i) {
+        stack.push(Elem::Start(i));
+      }
+    }
+  }
+  while let Some(elem) = stack.pop() {
+    match elem {
+      Elem::Start(i) => {
+        let blob = {
+          let (compressed, ref blob) = g.traces[&i];
+          let blob = maybe_decompress(compressed, blob);
+          let [Tree::Text(blob)] = *parse(&blob) else { panic!() };
+          unescape(blob)
+        };
+        let (bp, root) = BinParser::new(&blob);
+        let mut thms = ThmTrace::get_uses(&bp, root);
+        let mut todo = vec![];
+        for j in thms {
+          if !gthms.contains_key(&j) {
+            match uses.entry(j) {
+              std::collections::hash_map::Entry::Occupied(mut e) => {
+                if let Uses::Once = *e.get() {
+                  e.insert(Uses::Multiple);
+                }
+              }
+              std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(Uses::Once);
+              }
+            }
+            if reachable.insert(j) {
+              todo.push(j)
+            }
+          }
+        }
+        if !todo.is_empty() {
+          stack.push(Elem::Finish(Box::new((bp.pack(), blob, root))));
+          stack.extend(todo.into_iter().rev().map(Elem::Start))
+        }
+      }
+      Elem::Finish(elem) => {
+        let (bp, blob, root) = *elem;
+        let bp = BinParser::unpack(&blob, bp);
+        Checker::new(&bumpalo::Bump::new(), &g).check(&bp, root);
+      }
+    }
+  }
   Ok(())
 }
