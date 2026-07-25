@@ -13,7 +13,7 @@ use crate::{
   mk_id,
   trace::{
     self, proof, AssumptionId, BicomposeArgs, ClassId, HasBinParse, IdMapping, IndexNameId, MaxIdx,
-    Proof, ProofId, SortId, StringId, Subst, Term, TermId, ThmTrace, TypeId,
+    Proof, ProofId, SortId, StringId, Subst, Table, Term, TermId, ThmTrace, TypeId,
   },
   Global,
 };
@@ -789,10 +789,15 @@ impl<'a> Checker<'a> {
         (proof::EqElim, &[_, _]) => todo!(),
         (proof::FlexFlex, &[_, _]) => todo!(),
         (proof::Generalize, &[tfrees, frees, idx, p]) => {
+          // `Names.set` is `int Table.table` (a 2-3 tree), not a list: exportSmall dumps the
+          // table itself, where the old XML encoder flattened it via `Names.dest`.
+          let tfrees: Table<StringId, u32> = self.parse(&mut m, bp, tfrees);
+          let frees: Table<StringId, u32> = self.parse(&mut m, bp, frees);
+          let idx = self.parse(&mut m, bp, idx);
           let mut inst = Mapper::new(GenTerm::new(
-            self.parse(&mut m, bp, tfrees),
-            self.parse(&mut m, bp, frees),
-            self.parse(&mut m, bp, idx),
+            tfrees.0.into_iter().map(|(x, _)| x).collect(),
+            frees.0.into_iter().map(|(x, _)| x).collect(),
+            idx,
           ));
           let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
           CProof { shyps, hyps, concl: inst.apply(self, concl) }

@@ -99,7 +99,7 @@ impl MaxIdx {
 //   }
 // }
 
-pub struct Table<K, V>(Vec<(K, V)>);
+pub struct Table<K, V>(pub Vec<(K, V)>);
 
 impl<'a, C, K: BinParse<'a, C>, V: BinParse<'a, C>> BinParse<'a, C> for Table<K, V> {
   fn parse(ctx: &mut C, bp: &BinParser<'a>, p: TagPtr) -> Self {

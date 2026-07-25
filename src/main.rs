@@ -173,6 +173,28 @@ fn parse(bytes: &[u8]) -> Trees<'_> {
   head.into()
 }
 
+/// Reinterpret a 4-aligned byte buffer as the `u32` words of a `PolyML.exportSmall` image.
+fn into_words(out: AVec<u8, ConstAlign<4>>) -> Box<[u32]> {
+  let out = out.into_boxed_slice();
+  assert!(out.len() % 4 == 0, "truncated image");
+  unsafe {
+    let ptr = ABox::into_raw_parts(out).0;
+    let ptr = std::ptr::slice_from_raw_parts_mut(ptr as *mut u32, ptr.len() / 4);
+    Box::from_raw(ptr)
+  }
+}
+
+/// `proof_trace_raw/*` rows (v11): the image is streamed to the database verbatim by
+/// `PolyML.exportSmallToFD`, so there is no YXML wrapper and nothing to unescape --
+/// only the copy into an aligned buffer remains.
+fn to_words(bytes: &[u8]) -> Box<[u32]> {
+  let mut out = AVec::<u8, ConstAlign<4>>::new(4);
+  out.extend_from_slice(bytes);
+  into_words(out)
+}
+
+/// `proof_trace/*` rows (v10): the image went through `YXML.escape`, so bytes 5/6/251
+/// arrive escaped behind 251.
 fn unescape(mut bytes: &[u8]) -> Box<[u32]> {
   let mut out = AVec::<u8, ConstAlign<4>>::new(4);
   while let Some(i) = memchr::memchr(Z, bytes) {
@@ -186,13 +208,7 @@ fn unescape(mut bytes: &[u8]) -> Box<[u32]> {
     bytes = &bytes[i + 2..]
   }
   out.extend_from_slice(bytes);
-  let out = out.into_boxed_slice();
-  // assert!(out.len() % 4 == 0);
-  unsafe {
-    let ptr = ABox::into_raw_parts(out).0;
-    let ptr = std::ptr::slice_from_raw_parts_mut(ptr as *mut u32, ptr.len() / 4);
-    Box::from_raw(ptr)
-  }
+  into_words(out)
 }
 
 trait Parse<'a>: Sized {
@@ -1175,10 +1191,31 @@ struct Axiom {
   j: u32,
 }
 
+/// An exported proof trace, still in the form it has in the session database.
+struct Trace {
+  compressed: bool,
+  /// `proof_trace_raw/*` (v11, streamed via `exportSmallToFD`) rather than the
+  /// YXML-escaped `proof_trace/*` of v10.
+  raw: bool,
+  data: Box<[u8]>,
+}
+
+impl Trace {
+  fn decode(&self) -> Box<[u32]> {
+    let data = maybe_decompress(self.compressed, &self.data);
+    if self.raw {
+      to_words(&data)
+    } else {
+      let [Tree::Text(blob)] = *parse(&data) else { panic!("expected a single text node") };
+      unescape(blob)
+    }
+  }
+}
+
 #[derive(Default)]
 pub struct Global {
   proofs: HashMap<u32, ProofBox>,
-  traces: HashMap<u32, (bool, Box<[u8]>)>,
+  traces: HashMap<u32, Trace>,
   axioms: HashMap<String, Axiom>,
 }
 
@@ -1223,10 +1260,15 @@ impl Global {
       }
       let name = {
         let s = row.get_ref(2)?.as_str()?;
-        if let Some(s) = s.strip_prefix("proof_trace/") {
+        let raw = s.strip_prefix("proof_trace_raw/");
+        if let Some(s) = raw.or_else(|| s.strip_prefix("proof_trace/")) {
           self.traces.insert(
             s.parse().unwrap(),
-            (row.get(4)?, row.get_ref(5)?.as_blob()?.to_vec().into_boxed_slice()),
+            Trace {
+              compressed: row.get(4)?,
+              raw: raw.is_some(),
+              data: row.get_ref(5)?.as_blob()?.to_vec().into_boxed_slice(),
+            },
           );
           continue;
         }
@@ -1494,12 +1536,7 @@ fn main() -> Result<()> {
   while let Some(elem) = stack.pop() {
     match elem {
       Elem::Start(i) => {
-        let blob = {
-          let (compressed, ref blob) = g.traces[&i];
-          let blob = maybe_decompress(compressed, blob);
-          let [Tree::Text(blob)] = *parse(&blob) else { panic!() };
-          unescape(blob)
-        };
+        let blob = g.traces[&i].decode();
         let (bp, root) = BinParser::new(&blob);
         let mut thms = ThmTrace::get_uses(&bp, root);
         let mut todo = vec![];
