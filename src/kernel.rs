@@ -1322,7 +1322,33 @@ impl<'a> Checker<'a> {
         (proof::Assumption, &[_, _]) => todo!(),
         (proof::EqAssumption, &[_]) => todo!(),
         (proof::Rotate, &[_, _, _]) => todo!(),
-        (proof::PermutePrems, &[_, _, _]) => todo!(),
+        // Thm.permute_prems j k: keep the first j premises, rotate the rest by k
+        (proof::PermutePrems, &[j, k, p]) => {
+          let j: u32 = self.parse(&mut m, bp, j);
+          let k = k.as_int();
+          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
+          let mut prems = vec![];
+          let mut rest = concl;
+          while let Some((h, t)) = self.try_dest_imp(rest) {
+            prems.push(h);
+            rest = t
+          }
+          let (fixed, moved) = prems.split_at(j as usize);
+          let n_j = moved.len() as i32;
+          let m2 = if k < 0 { n_j + k } else { k };
+          let prems = if m2 == 0 || m2 == n_j {
+            prems.clone()
+          } else {
+            assert!(0 < m2 && m2 < n_j, "permute_prems: k");
+            let (ps, qs) = moved.split_at(m2 as usize);
+            fixed.iter().chain(qs).chain(ps).copied().collect()
+          };
+          let mut concl = rest;
+          for &a in prems.iter().rev() {
+            concl = self.mk_imp(a, concl)
+          }
+          CProof { shyps, hyps, concl }
+        }
         // Thm.bicompose_aux: the rule `⟦rAs⟧ ⟹ B` is resolved against subgoal `Bi` of the
         // state `⟦Bs; Bi⟧ ⟹ C`, giving `⟦Bs; As⟧ ⟹ C` under the unifier `env`.
         // `p` proves the rule, `q` proves the state (thm.ML: deriv_rule2 … rder' sder).
@@ -1633,6 +1659,7 @@ struct InstTerm {
 impl InstTerm {
   fn new(mut subst: Subst, beta: bool, env_keys: bool) -> Self {
     let ty = Mapper::new(InstType::new(subst.tysubst));
+    // an Envir is keyed by indexname alone, an instantiation by (indexname, type)
     subst.subst.sort_by_key(|x| (x.0, x.1));
     Self { ty, subst: subst.subst, beta, env_keys }
   }
@@ -1658,20 +1685,28 @@ impl Map<TermId> for InstTerm {
       }
       Term::Var(x, ty) => {
         let ty2 = inst.f.ty.apply(ck, ty);
-        let key = if inst.f.env_keys { ty } else { ty2 };
-        match inst.f.subst.binary_search_by_key(&(x, key), |x| (x.0, x.1)) {
-          Ok(j) => {
-            let t = inst.f.subst[j].2;
-            // `Envir.norm_term` normalises the result again, since a unifier need not be
-            // idempotent; `Term_Subst.instantiate` does not -- it inserts the term as it
-            // stands, so a type variable inside it survives this substitution.
-            if inst.f.env_keys {
-              inst.apply(ck, t)
-            } else {
-              t
+        if inst.f.env_keys {
+          // An Envir's tenv is a Vartab: keyed by indexname alone, with the type in the
+          // value and matched by `Type.unified tyenv` -- i.e. modulo the type substitution
+          // (`lookup = lookup_check (Type.unified tyenv) tenv`).  Keying on the pair is
+          // over-specific and misses whenever the occurrence's type has been instantiated.
+          if let Ok(j) = inst.f.subst.binary_search_by_key(&x, |e| e.0) {
+            let (_, vt, t) = inst.f.subst[j];
+            let vt = inst.f.ty.apply(ck, vt);
+            if vt == ty2 {
+              // and unlike Term_Subst.instantiate, norm_term renormalises the result,
+              // since a unifier need not be idempotent
+              return inst.apply(ck, t);
             }
           }
-          _ => ck.alloc(Term::Var(x, ty2)),
+          ck.alloc(Term::Var(x, ty2))
+        } else {
+          // Thm.instantiate's Vars.table is keyed by (indexname, instantiated type), and
+          // inserts the term as it stands
+          match inst.f.subst.binary_search_by_key(&(x, ty2), |e| (e.0, e.1)) {
+            Ok(j) => inst.f.subst[j].2,
+            _ => ck.alloc(Term::Var(x, ty2)),
+          }
         }
       }
       Term::Abs(x, ty, e) => {

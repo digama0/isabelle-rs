@@ -44,6 +44,15 @@ impl TagPtr {
       _ => panic!("expected pointer"),
     }
   }
+  /// signed decode: an ML int is tagged `(v << 1) | 1`, so a negative value needs an
+  /// arithmetic shift (`permute_prems` takes a negative rotation)
+  pub fn as_int(self) -> i32 {
+    match self.unpack() {
+      Obj::UInt(_) => (self.0 as i32) >> 1,
+      _ => panic!("expected integer"),
+    }
+  }
+
   pub fn as_uint(self) -> u32 {
     match self.unpack() {
       Obj::UInt(n) => n,
