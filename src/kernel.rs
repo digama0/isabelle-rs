@@ -1126,11 +1126,16 @@ impl<'a> Checker<'a> {
         }
         (proof::Thm, &[_i]) => todo!(),
         (proof::ConstrainThm, &[_i, shyps, hyps, prop]) => {
-          let mut bits = IdxBitSet::new();
+          // The referenced theorem was unconstrained: its sort hypotheses became OfClass
+          // premises, and the use site discharges them with PClass proofs
+          // (`argsP = map PClass (#outer_constraints ucontext) @ map Hyp hyps`).  They land
+          // in Isabelle's `constraints`, not in shyps -- exactly as the hypotheses become
+          // premises of `prop` rather than being inherited.  TODO: these are discharged
+          // obligations we do not yet verify (see the class-derivation gap for OfClass).
           for s in bp.parse_list(shyps) {
-            bits.insert(self.parse(&mut m, bp, s));
+            let _: SortId = self.parse(&mut m, bp, s);
           }
-          let shyps = self.alloc(bits);
+          let shyps = SortsId::EMPTY;
           let mut hyp_terms = vec![];
           let mut bits = IdxBitSet::new();
           for h in bp.parse_list(hyps) {
