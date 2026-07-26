@@ -1150,26 +1150,28 @@ impl<'a> Checker<'a> {
           let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
           CProof { shyps, hyps, concl: inst.apply(self, concl) }
         }
-        (proof::Instantiate, &[tysubst, subst, p]) => {
+        (proof::Instantiate, &[tysubst, subst, sorts, p]) => {
           let mut inst = Mapper::new(InstTerm::new(
             Subst::from_assoc(&mut (&mut *self, &mut m), bp, tysubst, subst),
             false,
             false,
           ));
-          let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
+          let CProof { hyps, concl, .. } = self.ctx[m.proofs[&p]].0;
+          // Thm.instantiate sets shyps = shyps' outright, and prep_insts derives that from
+          // the *certified* Ctyp/Cterm sorts, which are inherited and so cannot be
+          // recomputed from the raw types and terms recorded here.
+          let shyps = self.parse_sorts(&mut m, bp, sorts);
           for &(v, vs, ty) in &inst.f.ty.f.subst.clone() {
             if *DEBUG_BC {
               println!("  [inst] tyvar {:?}:{:?} := {:?} contributing {:?}", self.pp(v),
                 self.pp(vs), self.pp(ty), self.pp(self.ctx[ty].1.sorts));
             }
-            shyps = self.union(shyps, self.ctx[ty].1.sorts);
           }
           for &(v, vt, tm) in &inst.f.subst.clone() {
             if *DEBUG_BC {
               println!("  [inst] var {:?}:{:?} := {:?} contributing {:?}", self.pp(v),
                 self.pp(vt), self.pp(tm), self.pp(self.ctx[tm].1.sorts));
             }
-            shyps = self.union(shyps, self.ctx[tm].1.sorts);
           }
           CProof { shyps, hyps, concl: inst.apply(self, concl) }
         }
