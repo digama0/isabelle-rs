@@ -1361,6 +1361,13 @@ impl<'a> Checker<'a> {
           // the unifier is what justifies replacing the subgoal by the rule's premises
           let b = inst.apply(self, b);
           let bi = inst.apply(self, bi);
+          if *DEBUG_BC {
+            for &(v, vt, tm) in &inst.f.subst.clone() {
+              println!("  [bc] env var {:?}:{:?} := {:?}", self.pp(v), self.pp(vt), self.pp(tm));
+            }
+            println!("  [bc] B  = {:?}", self.pp(b));
+            println!("  [bc] Bi = {:?}", self.pp(bi));
+          }
           Comparer::new(AConv).apply(self, b, bi);
 
           let mut concl = inst.apply(self, c);

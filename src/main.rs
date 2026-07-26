@@ -1338,7 +1338,24 @@ impl Global {
 
 lalrpop_mod!(root);
 
+thread_local! {
+  /// filled in by the panic hook, read back by `catch_unwind`
+  static LAST_PANIC: std::cell::RefCell<(String, String)> =
+    std::cell::RefCell::new((String::new(), String::new()));
+}
+
 fn main() -> Result<()> {
+  // record panics instead of printing them: the driver keeps going and reports a summary
+  std::panic::set_hook(Box::new(|info| {
+    let msg = info
+      .payload()
+      .downcast_ref::<String>()
+      .cloned()
+      .or_else(|| info.payload().downcast_ref::<&str>().map(|s| (*s).to_owned()))
+      .unwrap_or_else(|| "?".to_owned());
+    let loc = info.location().map_or_else(String::new, |l| format!("{}:{}", l.file(), l.line()));
+    LAST_PANIC.with(|p| *p.borrow_mut() = (msg, loc));
+  }));
   let isabelle_root = std::path::PathBuf::from("/home/mario/Documents/isabelle");
   let p = root::EntriesParser::new();
   let main = &*std::env::args().nth(1).unwrap().leak();
@@ -1522,6 +1539,8 @@ fn main() -> Result<()> {
     Start(u32),
     Finish(Box<(Vec<u32>, Box<[u32]>, TagPtr)>),
   }
+  let mut checked = 0usize;
+  let mut failures: HashMap<(String, String), usize> = Default::default();
   let mut reachable: HashSet<u32> = Default::default();
   let mut uses: HashMap<u32, Uses> = Default::default();
   let mut stack: Vec<Elem> = vec![];
@@ -1565,9 +1584,25 @@ fn main() -> Result<()> {
       Elem::Finish(elem) => {
         let (bp, blob, root) = *elem;
         let bp = BinParser::unpack(&blob, bp);
-        Checker::new(&bumpalo::Bump::new(), &g).check(&bp, root);
+        // keep going after a failure: one panic per run makes each investigation cost a
+        // full pass over the session
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+          Checker::new(&bumpalo::Bump::new(), &g).check(&bp, root)
+        }));
+        checked += 1;
+        if result.is_err() {
+          let (msg, loc) = LAST_PANIC.with(|p| p.borrow().clone());
+          *failures.entry((loc, msg)).or_insert(0) += 1;
+        }
       }
     }
+  }
+  let failed: usize = failures.values().sum();
+  println!("\n=== checked {checked} theorems, {failed} failed ===");
+  let mut rows: Vec<_> = failures.into_iter().collect();
+  rows.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+  for ((loc, msg), n) in rows {
+    println!("{n:6}  {loc}  {msg}");
   }
   Ok(())
 }
