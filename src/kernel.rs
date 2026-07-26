@@ -23,6 +23,8 @@ static DEBUG_STEPS: std::sync::LazyLock<bool> =
   std::sync::LazyLock::new(|| std::env::var_os("DEBUG_STEPS").is_some());
 static DEBUG_FINAL: std::sync::LazyLock<bool> =
   std::sync::LazyLock::new(|| std::env::var_os("DEBUG_FINAL").is_some());
+static DEBUG_TRACE: std::sync::LazyLock<bool> =
+  std::sync::LazyLock::new(|| std::env::var_os("DEBUG_TRACE").is_some());
 static DEBUG_BC: std::sync::LazyLock<bool> =
   std::sync::LazyLock::new(|| std::env::var_os("DEBUG_BC").is_some());
 
@@ -833,7 +835,9 @@ impl<'a> Checker<'a> {
       "proof_trace/{} = {}.{}",
       tr.header.serial, self.ctx.strings.0[tr.header.thm_name.name].0, tr.header.thm_name.i,
     );
-    println!("{}", pretty(&tr));
+    if *DEBUG_TRACE {
+      println!("{}", pretty(&tr));
+    }
     let trace::Header { mut prop, .. } = tr.header;
     let mut visited = BTreeSet::new();
     let mut stack = vec![tr.root];
@@ -1202,12 +1206,12 @@ impl<'a> Checker<'a> {
             concl = self.mk_imp(bj, concl)
           }
 
+          // `Envir.insert_sorts` folds over the *type* env only
+          // (`Vartab.fold (Sorts.insert_typ o #2 o #2) o type_env`): the terms assigned by
+          // the term env are already accounted for in the premises' own shyps.
           let mut shyps = self.union(shyps1, shyps2);
           for &(_, _, ty) in &inst.f.ty.f.subst {
             shyps = self.union(shyps, self.ctx[ty].1.sorts)
-          }
-          for &(_, _, tm) in &inst.f.subst {
-            shyps = self.union(shyps, self.ctx[tm].1.sorts)
           }
           CProof { shyps, hyps: self.union(hyps1, hyps2), concl }
         }
@@ -1252,8 +1256,16 @@ impl<'a> Checker<'a> {
       let classes: BTreeSet<_> = classes.into_iter().map(|s| s.1).collect();
       for s in self.ctx[shyps].0.iter() {
         if s != SortId::TOP {
-          let s = &self.ctx[s].0;
-          assert!(classes.iter().any(|c| s.is_subset(c)))
+          let sc = &self.ctx[s].0;
+          if !classes.iter().any(|c| sc.is_subset(c)) {
+            println!("!! shyp not covered: {:?}", self.pp(s));
+            println!("   unconstrain_shyps = {}", tr.unconstrain_shyps);
+            println!("   classes = {:?}",
+              classes.iter().map(|c| c.iter().map(|c| self.pp(c)).collect::<Vec<_>>())
+                .collect::<Vec<_>>());
+            println!("   all shyps = {:?}", self.pp(shyps));
+          }
+          assert!(classes.iter().any(|c| sc.is_subset(c)))
         }
       }
     }
