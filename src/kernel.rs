@@ -871,15 +871,53 @@ impl<'a> Checker<'a> {
       let pf2 = match bp.get_enum(pf) {
         // debug wrapper (option prooftrace_props): the statement its subproof proves, so a
         // divergence is reported at the inference that caused it rather than at the end
-        (proof::ZProp, &[prop, p]) => {
+        (proof::ZProp, &[prop, shyps, tpairs, p]) => {
           let cp = self.ctx[m.proofs[&p]].0.clone();
+          let inner = bp.get_enum(p).0;
+
           let recorded: TermId = self.parse(&mut m, bp, prop);
           if !self.aconv(recorded, cp.concl, &mut HashSet::new()) {
-            let inner = bp.get_enum(p).0;
             println!("!! statement mismatch after rule {inner}");
             println!("   computed: {:?}", self.pp(cp.concl));
             println!("   recorded: {:?}", self.pp(recorded));
             panic!("statement mismatch at rule {inner}");
+          }
+
+          // compare modulo the trivial sort: an unconstrained type variable contributes the
+          // empty class set, which is satisfied by everything and which the final
+          // unconstrain check skips as well
+          let mut want = IdxBitSet::new();
+          for s in bp.parse_list(shyps) {
+            let s: SortId = self.parse(&mut m, bp, s);
+            if s != SortId::TOP {
+              want.insert(s);
+            }
+          }
+          let mut got = self.ctx[cp.shyps].0.clone();
+          got.remove(SortId::TOP);
+          // Isabelle's shyps is an over-approximation carried along by cterm operations
+          // (Sorts.insert_term only ever adds, and Cterm.sorts is inherited), whereas this
+          // checker recomputes from the statement.  So the sets legitimately differ; report
+          // both directions rather than asserting, and distinguish them: sorts we invent
+          // that Isabelle never had are the ones that break the final unconstrain check.
+          if want != got {
+            let invented =
+              got.iter().filter(|&s| !want.contains(s)).map(|s| self.pp(s)).collect::<Vec<_>>();
+            let dropped =
+              want.iter().filter(|&s| !got.contains(s)).map(|s| self.pp(s)).collect::<Vec<_>>();
+            if !invented.is_empty() {
+              println!("!! rule {inner} invents sorts {invented:?} (recorded: {:?})",
+                want.iter().map(|s| self.pp(s)).collect::<Vec<_>>());
+            }
+            if !dropped.is_empty() {
+              println!("?? rule {inner} drops sorts {dropped:?} that Isabelle carries");
+            }
+          }
+
+          // we do not model flex-flex pairs yet: report rather than pass over them
+          let n_tpairs = bp.parse_list(tpairs).count();
+          if n_tpairs != 0 {
+            println!("!! rule {inner} leaves {n_tpairs} flex-flex pair(s), which CProof does not carry");
           }
           cp
         }
