@@ -926,6 +926,20 @@ impl<'a> Checker<'a> {
               println!("   dropped:  {dropped:?}");
             }
             println!("   for:      {:?}", self.pp(cp.concl));
+            // did the *input* to this rule already differ?  If its subproofs are wrapped,
+            // their recorded shyps were checked and matched, so a divergence here is the
+            // rule's own doing; an unwrapped subproof is an untraced boundary instead.
+            for &sp in proof::subproofs(bp, p) {
+              let (tag, args) = bp.get_enum(sp);
+              let ours = self.pp(self.ctx[m.proofs[&sp]].0.shyps);
+              if tag == proof::ZProp {
+                let rec = self.parse_sorts(&mut m, bp, args[1]);
+                println!("   subproof: ZProp over rule {} recorded {:?}, ours {ours:?}",
+                  bp.get_enum(args[3]).0, self.pp(rec));
+              } else {
+                println!("   subproof: rule {tag} is UNWRAPPED, ours {ours:?}");
+              }
+            }
             panic!("shyps mismatch at rule {inner}");
           }
 
@@ -1057,7 +1071,7 @@ impl<'a> Checker<'a> {
           let concl = self.mk_eq(t, rhs);
           CProof { shyps, hyps: HypsId::EMPTY, concl }
         }
-        (proof::EtaLong, &[_]) => todo!(),
+        (proof::EtaLong, &[_, _sorts]) => todo!(),
         (proof::StripSHyps, &[sorts, p]) => {
           let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
           if *DEBUG_STEPS {
@@ -1175,7 +1189,13 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps, concl: inst.apply(self, concl) }
         }
-        (proof::Trivial, &[]) => todo!(),
+        // Thm.trivial: from a proposition A, the theorem A ==> A
+        (proof::Trivial, &[t, sorts]) => {
+          let t: TermId = self.parse(&mut m, bp, t);
+          let shyps = self.parse_sorts(&mut m, bp, sorts);
+          let concl = self.mk_imp(t, t);
+          CProof { shyps, hyps: HypsId::EMPTY, concl }
+        }
         (proof::OfClass, &[ty, c]) => {
           let OfClassCache { itself, type_ } = self.ofclass_cache.unwrap_or_else(|| {
             let itself = self.alloc("itself");
@@ -1327,7 +1347,7 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps: self.union(hyps1, hyps2), concl }
         }
-        _ => panic!(),
+        (tag, args) => panic!("unhandled rule {tag} with {} argument(s)", args.len()),
       };
       // println!(
       //   "{pf:?} => {:?}, {:?} |- {:?}",
