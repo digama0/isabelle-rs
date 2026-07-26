@@ -132,7 +132,8 @@ impl<'a, C, K: BinParse<'a, C>, V: BinParse<'a, C>> BinParse<'a, C> for Table<K,
           accum(ctx, bp, out, t2);
         }
         (Branch3, &[args]) => {
-          let &[t1, kv1, t2, kv2, t3] = bp.get(p.as_ptr()).as_tuple_n();
+          // five fields, boxed into a sub-tuple: read `args`, not the enum object itself
+          let &[t1, kv1, t2, kv2, t3] = bp.get(args.as_ptr()).as_tuple_n();
           accum(ctx, bp, out, t1);
           out.push(bp.parse(ctx, kv1));
           accum(ctx, bp, out, t2);

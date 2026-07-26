@@ -18,6 +18,14 @@ use crate::{
   Global,
 };
 
+/// debug hooks, all off unless the corresponding variable is set
+static DEBUG_STEPS: std::sync::LazyLock<bool> =
+  std::sync::LazyLock::new(|| std::env::var_os("DEBUG_STEPS").is_some());
+static DEBUG_FINAL: std::sync::LazyLock<bool> =
+  std::sync::LazyLock::new(|| std::env::var_os("DEBUG_FINAL").is_some());
+static DEBUG_BC: std::sync::LazyLock<bool> =
+  std::sync::LazyLock::new(|| std::env::var_os("DEBUG_BC").is_some());
+
 mk_id! {
   HypId(u32),
   HypsId(u32),
@@ -379,9 +387,14 @@ impl TypeData {
 struct TermData {
   sorts: SortsId,
   maxidx: MaxIdx,
-  /// if Err(i), then the largest Bound var blocking the type is i
+  /// if Err(i), then the largest Bound var blocking the type is i; `UNKNOWN_TY` means the
+  /// head of an application has no function type yet (an uninstantiated type variable), so
+  /// the type is only determined once a substitution has been applied
   ty: Result<TypeId, u32>,
 }
+
+/// see [`TermData::ty`]
+const UNKNOWN_TY: u32 = u32::MAX;
 
 impl TermData {
   fn mk(ck: &mut Checker<'_>, t: &Term) -> TermData {
@@ -405,9 +418,12 @@ impl TermData {
         let sorts = ck.union(ds, es);
         let ty = match ty {
           Ok(rng) => Ok(ck.mk_fun(dom, rng)),
+          // the body's type is only determined under the binder; the lambda's type is
+          // still `dom -> body`, not the body's type
           Err(0) => {
             let lctx = ck.mk_lctx(LCtxId::NIL, dom);
-            Ok(ck.get_type_ctx(lctx, e))
+            let rng = ck.get_type_ctx(lctx, e);
+            Ok(ck.mk_fun(dom, rng))
           }
           Err(i) => Err(i - 1),
         };
@@ -416,7 +432,13 @@ impl TermData {
       Term::App(e1, e2) => {
         let TermData { sorts: s1, maxidx: m1, ty: ty1 } = ck.ctx[e1].1;
         let TermData { sorts: s2, maxidx: m2, ty: _ } = ck.ctx[e2].1;
-        let ty = ty1.map(|ty| ck.ctx[ty].0.as_fun().1);
+        let ty = match ty1 {
+          Ok(ty) => match ck.ctx[ty].0 {
+            Type::Type(StringId::FUN, &[_, rng]) => Ok(rng),
+            _ => Err(UNKNOWN_TY),
+          },
+          e => e,
+        };
         let sorts = ck.union(s1, s2);
         TermData { sorts, maxidx: m1.max(m2), ty }
       }
@@ -690,6 +712,33 @@ impl<'a> Checker<'a> {
     self.try_dest_eq(a).expect("expected equality")
   }
 
+  /// `Term.loose_bvar1 (t, lev)`: does the bound variable `lev` occur loose in `t`?
+  fn loose_bvar1(&self, t: TermId, lev: u32) -> bool {
+    match self.ctx[t].0 {
+      Term::Bound(i) => i == lev,
+      Term::Abs(_, _, e) => self.loose_bvar1(e, lev + 1),
+      Term::App(f, u) => self.loose_bvar1(f, lev) || self.loose_bvar1(u, lev),
+      _ => false,
+    }
+  }
+
+  /// `Envir.decr_same`: decrement loose bound variables at or above `lev`.
+  fn decr_bound(&mut self, t: TermId, lev: u32) -> TermId {
+    match self.ctx[t].0 {
+      Term::Bound(i) if i >= lev => self.alloc(Term::Bound(i - 1)),
+      Term::Abs(x, ty, e) => {
+        let e = self.decr_bound(e, lev + 1);
+        self.alloc(Term::Abs(x, ty, e))
+      }
+      Term::App(f, u) => {
+        let f = self.decr_bound(f, lev);
+        let u = self.decr_bound(u, lev);
+        self.alloc(Term::App(f, u))
+      }
+      _ => t,
+    }
+  }
+
   /// Does `x` occur in `t`? Used for the eigenvariable condition of `abstract_rule`.
   fn occurs(&self, x: TermId, t: TermId, seen: &mut HashSet<TermId>) -> bool {
     if x == t {
@@ -706,7 +755,9 @@ impl<'a> Checker<'a> {
   }
 
   fn mk_eq(&mut self, a: TermId, b: TermId) -> TermId {
-    let ty = self.ctx[a].1.ty.unwrap();
+    // not `TermData::ty`: that is blocked for a term whose type only follows from the
+    // local context (e.g. a beta redex under a binder)
+    let ty = self.get_type_ctx(LCtxId::NIL, a);
     let ty2 = self.mk_fun(ty, TypeId::PROP);
     let ty2 = self.mk_fun(ty, ty2);
     let eq = self.alloc(Term::Const(StringId::EQ, ty2));
@@ -885,9 +936,29 @@ impl<'a> Checker<'a> {
           let concl = self.mk_eq(t1, t2);
           CProof { shyps: self.union(shyps1, shyps2), hyps: self.union(hyps1, hyps2), concl }
         }
-        (proof::BetaNorm, &[_]) => todo!(),
-        (proof::BetaHead, &[_]) => todo!(),
-        (proof::Eta, &[_]) => todo!(),
+        // Thm.beta_conversion true: `t ≡ Envir.beta_norm t`
+        (proof::BetaNorm, &[t]) => {
+          let t: TermId = self.parse(&mut m, bp, t);
+          let rhs = BetaNorm::new().apply(self, t);
+          let concl = self.mk_eq(t, rhs);
+          CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
+        }
+        // Thm.beta_conversion false: one step at the head, `(λx. b) u ≡ b[u]`
+        (proof::BetaHead, &[t]) => {
+          let t: TermId = self.parse(&mut m, bp, t);
+          let (f, u) = self.dest_app(t);
+          let Term::Abs(_, _, b) = self.ctx[f].0 else { panic!("beta_conversion: not a redex") };
+          let rhs = SubstBound::new(&[u]).apply(self, b, 0);
+          let concl = self.mk_eq(t, rhs);
+          CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
+        }
+        // Thm.eta_conversion: `t ≡ Envir.eta_contract t`
+        (proof::Eta, &[t]) => {
+          let t: TermId = self.parse(&mut m, bp, t);
+          let rhs = EtaContract::new().apply(self, t);
+          let concl = self.mk_eq(t, rhs);
+          CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
+        }
         (proof::EtaLong, &[_]) => todo!(),
         (proof::StripSHyps, &[sorts, p]) => {
           let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
@@ -1012,13 +1083,26 @@ impl<'a> Checker<'a> {
             bits.insert(self.parse(&mut m, bp, s));
           }
           let shyps = self.alloc(bits);
+          let mut hyp_terms = vec![];
           let mut bits = IdxBitSet::new();
           for h in bp.parse_list(hyps) {
             let h = self.parse(&mut m, bp, h);
+            hyp_terms.push(h);
             bits.insert(self.alloc(h));
           }
           let hyps = self.alloc(bits);
-          CProof { shyps, hyps, concl: self.parse(&mut m, bp, prop) }
+          // `prepare_thm_proof` records `prop = Logic.list_implies (hyps, concl)`, and the
+          // reference is used applied to those hypotheses (`argsP = … map Hyp hyps`).  So
+          // strip them back off, keeping them as hypotheses -- leaving them as premises as
+          // well would count each one twice.
+          let mut concl: TermId = self.parse(&mut m, bp, prop);
+          let mut cmp = Comparer::new(AConv);
+          for &h in &hyp_terms {
+            let (arg, rest) = self.dest_imp(concl);
+            cmp.apply(self, h, arg);
+            concl = rest
+          }
+          CProof { shyps, hyps, concl }
         }
         (proof::Varify, &[args, p]) => {
           let mut subst = bp
@@ -1094,6 +1178,13 @@ impl<'a> Checker<'a> {
           }
           let (bi, c) = self.dest_imp(st);
 
+          if *DEBUG_BC {
+            println!("  [bc] nbs={} nsubgoal={} flatten={} n={} nlift={} tpairs={} as={}",
+              args.nbs, args.nsubgoal, args.flatten, args.n, args.nlift,
+              args.tpairs.len(), args.as_.len());
+            println!("       p(rule?)  = {:?}", self.pp(rule));
+            println!("       q(state?) = {:?}", self.pp(state));
+          }
           let mut inst = Mapper::new(InstTerm::new(args.env, true, true));
           // the unifier is what justifies replacing the subgoal by the rule's premises
           let b = inst.apply(self, b);
@@ -1128,6 +1219,9 @@ impl<'a> Checker<'a> {
       //   self.pp(pf2.hyps),
       //   self.pp(pf2.concl)
       // );
+      if *DEBUG_STEPS {
+        println!("  rule {:2} => {:?}", bp.get_enum(pf).0, self.pp(pf2.concl));
+      }
       m.proofs.insert(pf, self.alloc(pf2));
     }
     let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&tr.root]].0;
@@ -1175,6 +1269,11 @@ impl<'a> Checker<'a> {
       assert!(hyps.is_empty());
     }
     let concl = inst_var.apply(self, concl);
+    if *DEBUG_FINAL {
+      println!("=== final check");
+      println!("  got  = {:?}", self.pp(concl));
+      println!("  want = {:?}", self.pp(prop));
+    }
     compare.apply(self, concl, prop);
   }
 }
@@ -1531,6 +1630,79 @@ impl IncrBound {
 }
 
 /// `Term.abstract_over`: replace a variable by the bound variable of a new abstraction.
+/// `Envir.beta_norm`: full beta normal form.
+struct BetaNorm {
+  map: HashMap<TermId, TermId>,
+}
+impl BetaNorm {
+  fn new() -> Self {
+    Self { map: HashMap::new() }
+  }
+
+  fn apply(&mut self, ck: &mut Checker<'_>, t: TermId) -> TermId {
+    if let Some(&t) = self.map.get(&t) {
+      return t;
+    }
+    let ret = match ck.ctx[t].0 {
+      Term::Abs(x, ty, e) => {
+        let e = self.apply(ck, e);
+        ck.alloc(Term::Abs(x, ty, e))
+      }
+      Term::App(f, u) => {
+        let f = self.apply(ck, f);
+        if let Term::Abs(_, _, b) = ck.ctx[f].0 {
+          let t = SubstBound::new(&[u]).apply(ck, b, 0);
+          self.apply(ck, t)
+        } else {
+          let u = self.apply(ck, u);
+          ck.alloc(Term::App(f, u))
+        }
+      }
+      _ => t,
+    };
+    self.map.insert(t, ret);
+    ret
+  }
+}
+
+/// `Envir.eta_contract`: bottom-up, replacing `Abs (a, T, f $ Bound 0)` by `f` whenever `f`
+/// has no loose `Bound 0` (`Term.is_dependent`).
+struct EtaContract {
+  map: HashMap<TermId, TermId>,
+}
+impl EtaContract {
+  fn new() -> Self {
+    Self { map: HashMap::new() }
+  }
+
+  fn apply(&mut self, ck: &mut Checker<'_>, t: TermId) -> TermId {
+    if let Some(&t) = self.map.get(&t) {
+      return t;
+    }
+    let ret = match ck.ctx[t].0 {
+      Term::Abs(x, ty, body) => {
+        let body = self.apply(ck, body);
+        match ck.ctx[body].0 {
+          Term::App(f, arg)
+            if matches!(ck.ctx[arg].0, Term::Bound(0)) && !ck.loose_bvar1(f, 0) =>
+          {
+            ck.decr_bound(f, 0)
+          }
+          _ => ck.alloc(Term::Abs(x, ty, body)),
+        }
+      }
+      Term::App(f, u) => {
+        let f = self.apply(ck, f);
+        let u = self.apply(ck, u);
+        ck.alloc(Term::App(f, u))
+      }
+      _ => t,
+    };
+    self.map.insert(t, ret);
+    ret
+  }
+}
+
 struct AbstractOver {
   x: TermId,
   map: HashMap<(TermId, u32), TermId>,
