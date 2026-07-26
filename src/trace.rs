@@ -165,6 +165,10 @@ impl Subst {
     }
   }
   pub fn from_env<C: IdMapping>(ctx: &mut C, bp: &BinParser<'_>, p: TagPtr) -> Self {
+    // `Envir.env` is `Envir of {maxidx: int, tenv: tenv, tyenv: Type.tyenv}` -- a
+    // single-constructor datatype, so the value is the record itself, and Poly/ML orders
+    // record fields alphabetically: maxidx, tenv, tyenv.
+    // field order determined empirically from an exportSmall dump: tenv, tyenv, maxidx
     let (tenv, tyenv, _maxidx): (Table<_, _>, Table<_, _>, TagPtr) = bp.parse(ctx, p);
     Self {
       tysubst: tyenv.0.into_iter().map(|(a, (b, c))| (a, b, c)).collect(),
@@ -199,10 +203,14 @@ pub struct BicomposeArgs {
   pub a_: Option<TermId>,
   pub n: u32,
   pub nlift: u32,
+  /// number of state premises before the subgoal being replaced (`length Bs` in
+  /// `Thm.bicompose_aux`), without which the new premises cannot be spliced in
+  pub nbs: u32,
 }
 impl<C: IdMapping> BinParse<'_, C> for BicomposeArgs {
   fn parse(ctx: &mut C, bp: &BinParser<'_>, p: TagPtr) -> Self {
-    let &[env, tpairs, nsubgoal, flatten, as_, a_, n, nlift] = bp.get(p.as_ptr()).as_tuple_n();
+    let &[env, tpairs, nsubgoal, flatten, as_, a_, n, nlift, nbs] =
+      bp.get(p.as_ptr()).as_tuple_n();
     Self {
       env: Subst::from_env(ctx, bp, env),
       tpairs: bp.parse(ctx, tpairs),
@@ -212,6 +220,7 @@ impl<C: IdMapping> BinParse<'_, C> for BicomposeArgs {
       a_: bp.parse(ctx, a_),
       n: bp.parse(ctx, n),
       nlift: bp.parse(ctx, nlift),
+      nbs: bp.parse(ctx, nbs),
     }
   }
 }

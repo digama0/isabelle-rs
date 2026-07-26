@@ -433,7 +433,6 @@ struct OfClassCache {
 pub struct Checker<'a> {
   ctx: CheckerCtx<'a>,
   type_cache: HashMap<(LCtxId, TermId), TypeId>,
-  eq: Option<StringId>,
   imp: Option<TermId>,
   ofclass_cache: Option<OfClassCache>,
   alloc: &'a bumpalo::Bump,
@@ -443,6 +442,10 @@ pub struct Checker<'a> {
 impl StringId {
   const FUN: Self = Self(0);
   const PROP: Self = Self(1);
+  // interned up front by `Checker::new`, so the destructors below compare ids, not strings
+  const EQ: Self = Self(2);
+  const IMP: Self = Self(3);
+  const ALL: Self = Self(4);
 }
 impl BitSetIdx<'_> for HypsId {
   const EMPTY: Self = Self(0);
@@ -470,11 +473,13 @@ impl<'a> Checker<'a> {
       g,
       type_cache: Default::default(),
       ofclass_cache: None,
-      eq: None,
       imp: None,
     };
     ck.alloc::<StringId>("fun");
     ck.alloc::<StringId>("prop");
+    ck.alloc::<StringId>("Pure.eq");
+    ck.alloc::<StringId>("Pure.imp");
+    ck.alloc::<StringId>("Pure.all");
     ck.alloc::<HypsId>(IdxBitSet::new());
     ck.alloc::<SortId>(IdxBitSet::new());
     ck.alloc::<SortsId>(IdxBitSet::new());
@@ -565,7 +570,7 @@ impl<'a> Checker<'a> {
     let (f, e2) = self.try_dest_app(a)?;
     let (f, e1) = self.try_dest_app(f)?;
     let (c, _) = self.try_dest_const(f)?;
-    if self.ctx[c].0 != "Pure.imp" {
+    if c != StringId::IMP {
       return None;
     }
     Some((e1, e2))
@@ -578,8 +583,7 @@ impl<'a> Checker<'a> {
     self.imp.unwrap_or_else(|| {
       let ty = self.mk_fun(TypeId::PROP, TypeId::PROP);
       let ty = self.mk_fun(TypeId::PROP, ty);
-      let s = self.alloc("Pure.imp");
-      let imp = self.alloc(Term::Const(s, ty));
+      let imp = self.alloc(Term::Const(StringId::IMP, ty));
       *self.imp.insert(imp)
     })
   }
@@ -590,10 +594,69 @@ impl<'a> Checker<'a> {
     self.alloc(Term::App(f, b))
   }
 
+  fn mk_forall(&mut self, x: StringId, ty: TypeId, body: TermId) -> TermId {
+    let pred = self.mk_fun(ty, TypeId::PROP);
+    let cty = self.mk_fun(pred, TypeId::PROP);
+    let all = self.alloc(Term::Const(StringId::ALL, cty));
+    let abs = self.alloc(Term::Abs(x, ty, body));
+    self.alloc(Term::App(all, abs))
+  }
+
+  /// `Logic.strip_params`: the `⋀`-bound parameters, descending through `⟹` as well.
+  fn strip_params(&self, mut a: TermId, out: &mut Vec<(StringId, TypeId)>) {
+    loop {
+      if let Some((_, b)) = self.try_dest_imp(a) {
+        a = b
+      } else if let Some((_, e)) = self.try_dest_forall(a) {
+        let Term::Abs(x, ty, t) = self.ctx[e].0 else { break };
+        out.push((x, ty));
+        a = t
+      } else {
+        break
+      }
+    }
+  }
+
+  /// `Logic.remove_params`: drop `j` leading parameters and the `n`-th premise, shifting the
+  /// premises that survive over the removed binders.
+  fn remove_params(&mut self, j: u32, n: i64, a: TermId) -> TermId {
+    if j == 0 && n <= 0 {
+      return a;
+    }
+    if let Some((h, b)) = self.try_dest_imp(a) {
+      let b = self.remove_params(j, n - 1, b);
+      if n == 1 {
+        b
+      } else {
+        let h = IncrBound::new().apply0(self, h, j);
+        self.mk_imp(h, b)
+      }
+    } else if let Some((_, e)) = self.try_dest_forall(a) {
+      let Term::Abs(_, _, t) = self.ctx[e].0 else { panic!("expected abstraction under Pure.all") };
+      self.remove_params(j - 1, n, t)
+    } else {
+      assert!(n <= 0, "remove_params: not enough premises");
+      a
+    }
+  }
+
+  /// `Logic.flatten_params`: move the parameters of a subgoal to the front, dropping the
+  /// `n`-th premise (`n = 0` keeps them all). Parameter names are irrelevant here, since
+  /// every comparison in this checker is up to alpha.
+  fn flatten_params(&mut self, n: u32, a: TermId) -> TermId {
+    let mut params = vec![];
+    self.strip_params(a, &mut params);
+    let mut body = self.remove_params(params.len() as u32, n as i64, a);
+    for &(x, ty) in params.iter().rev() {
+      body = self.mk_forall(x, ty, body)
+    }
+    body
+  }
+
   fn try_dest_forall(&self, a: TermId) -> Option<(TypeId, TermId)> {
     let (f, e) = self.try_dest_app(a)?;
     let (c, ty) = self.try_dest_const(f)?;
-    if self.ctx[c].0 != "Pure.all" {
+    if c != StringId::ALL {
       return None;
     }
     let (ty, _) = self.try_dest_fun(ty)?;
@@ -613,19 +676,40 @@ impl<'a> Checker<'a> {
     (ty, self.alloc(s))
   }
 
-  fn mk_eq_str(&mut self) -> StringId {
-    self.eq.unwrap_or_else(|| {
-      let eq = self.alloc("Pure.eq");
-      *self.eq.insert(eq)
-    })
+  fn try_dest_eq(&self, a: TermId) -> Option<(TermId, TermId)> {
+    let (f, rhs) = self.try_dest_app(a)?;
+    let (f, lhs) = self.try_dest_app(f)?;
+    let (c, _) = self.try_dest_const(f)?;
+    if c != StringId::EQ {
+      return None;
+    }
+    Some((lhs, rhs))
+  }
+
+  fn dest_eq(&self, a: TermId) -> (TermId, TermId) {
+    self.try_dest_eq(a).expect("expected equality")
+  }
+
+  /// Does `x` occur in `t`? Used for the eigenvariable condition of `abstract_rule`.
+  fn occurs(&self, x: TermId, t: TermId, seen: &mut HashSet<TermId>) -> bool {
+    if x == t {
+      return true;
+    }
+    if !seen.insert(t) {
+      return false;
+    }
+    match self.ctx[t].0 {
+      Term::Abs(_, _, e) => self.occurs(x, e, seen),
+      Term::App(f, a) => self.occurs(x, f, seen) || self.occurs(x, a, seen),
+      _ => false,
+    }
   }
 
   fn mk_eq(&mut self, a: TermId, b: TermId) -> TermId {
     let ty = self.ctx[a].1.ty.unwrap();
-    let eq = self.mk_eq_str();
     let ty2 = self.mk_fun(ty, TypeId::PROP);
     let ty2 = self.mk_fun(ty, ty2);
-    let eq = self.alloc(Term::Const(eq, ty2));
+    let eq = self.alloc(Term::Const(StringId::EQ, ty2));
     let f = self.alloc(Term::App(eq, a));
     self.alloc(Term::App(f, b))
   }
@@ -710,7 +794,8 @@ impl<'a> Checker<'a> {
     for pf in visited {
       #[allow(non_upper_case_globals)]
       let pf2 = match bp.get_enum(pf) {
-        (proof::Sorry | proof::Pruned, _) => panic!("encountered Sorry / Pruned"),
+        (proof::Sorry, _) => panic!("encountered Sorry (unrecorded proof: promise/future?)"),
+        (proof::Pruned, _) => panic!("encountered Pruned (prune_proofs?)"),
         (proof::Hyp, &[concl]) => {
           let concl: TermId = self.parse(&mut m, bp, concl);
           let shyps = self.ctx[concl].1.sorts;
@@ -737,7 +822,27 @@ impl<'a> Checker<'a> {
           Comparer::new(AConv).apply(self, lhs, lhs2);
           CProof { shyps, hyps, concl }
         }
-        (proof::ForallIntr, &[_, _]) => todo!(),
+        // Thm.forall_intr: from `A` infer `⋀x. A`, x not free in the hypotheses.
+        // shyps gains the sorts of x's type (`Sorts.union sorts shyps`).
+        (proof::ForallIntr, &[x, p]) => {
+          let x: TermId = self.parse(&mut m, bp, x);
+          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
+          if hyps != HypsId::EMPTY {
+            let mut seen = HashSet::new();
+            for h in self.ctx[hyps].0.clone().iter() {
+              assert!(!self.occurs(x, self.ctx[h].0, &mut seen), "forall_intr: variable free in hyps")
+            }
+          }
+          let name = match self.ctx[x].0 {
+            Term::Free(n, _) => n,
+            Term::Var(n, _) => self.ctx[n].0 .0,
+            _ => panic!("forall_intr: expected a variable"),
+          };
+          let ty = self.ctx[x].1.ty.unwrap();
+          let shyps = self.union(shyps, self.ctx[x].1.sorts);
+          let body = AbstractOver::new(x).apply(self, concl, 0);
+          CProof { shyps, hyps, concl: self.mk_forall(name, ty, body) }
+        }
         (proof::ForallElim, &[t, p]) => {
           let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
           let t: TermId = self.parse(&mut m, bp, t);
@@ -765,8 +870,21 @@ impl<'a> Checker<'a> {
           let concl = self.mk_eq(t, t);
           CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
         }
-        (proof::Symm, &[_]) => todo!(),
-        (proof::Trans, &[_, _]) => todo!(),
+        // Thm.symmetric / Thm.transitive
+        (proof::Symm, &[p]) => {
+          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
+          let (t, u) = self.dest_eq(concl);
+          CProof { shyps, hyps, concl: self.mk_eq(u, t) }
+        }
+        (proof::Trans, &[p, q]) => {
+          let CProof { shyps: shyps1, hyps: hyps1, concl: c1 } = self.ctx[m.proofs[&p]].0;
+          let CProof { shyps: shyps2, hyps: hyps2, concl: c2 } = self.ctx[m.proofs[&q]].0;
+          let (t1, u1) = self.dest_eq(c1);
+          let (u2, t2) = self.dest_eq(c2);
+          Comparer::new(AConv).apply(self, u1, u2);
+          let concl = self.mk_eq(t1, t2);
+          CProof { shyps: self.union(shyps1, shyps2), hyps: self.union(hyps1, hyps2), concl }
+        }
         (proof::BetaNorm, &[_]) => todo!(),
         (proof::BetaHead, &[_]) => todo!(),
         (proof::Eta, &[_]) => todo!(),
@@ -783,10 +901,61 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps, concl }
         }
-        (proof::AbsRule, &[_, _]) => todo!(),
-        (proof::AppRule, &[_, _]) => todo!(),
-        (proof::EqIntr, &[_, _]) => todo!(),
-        (proof::EqElim, &[_, _]) => todo!(),
+        // Thm.abstract_rule: from `t ≡ u` infer `(λx. t) ≡ (λx. u)`, provided `x` is not
+        // free in the hypotheses (the eigenvariable condition).
+        (proof::AbsRule, &[x, p]) => {
+          let x: TermId = self.parse(&mut m, bp, x);
+          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
+          let (t, u) = self.dest_eq(concl);
+          if hyps != HypsId::EMPTY {
+            let mut seen = HashSet::new();
+            for h in self.ctx[hyps].0.clone().iter() {
+              assert!(!self.occurs(x, self.ctx[h].0, &mut seen), "abstract_rule: variable free in hyps")
+            }
+          }
+          let name = match self.ctx[x].0 {
+            Term::Free(n, _) => n,
+            Term::Var(n, _) => self.ctx[n].0 .0,
+            _ => panic!("abstract_rule: expected a variable"),
+          };
+          let ty = self.ctx[x].1.ty.unwrap();
+          let t = AbstractOver::new(x).apply(self, t, 0);
+          let u = AbstractOver::new(x).apply(self, u, 0);
+          let f = self.alloc(Term::Abs(name, ty, t));
+          let g = self.alloc(Term::Abs(name, ty, u));
+          CProof { shyps, hyps, concl: self.mk_eq(f, g) }
+        }
+        // Thm.combination: from `f ≡ g` and `t ≡ u` infer `f t ≡ g u`
+        (proof::AppRule, &[p, q]) => {
+          let CProof { shyps: shyps1, hyps: hyps1, concl: c1 } = self.ctx[m.proofs[&p]].0;
+          let CProof { shyps: shyps2, hyps: hyps2, concl: c2 } = self.ctx[m.proofs[&q]].0;
+          let (f, g) = self.dest_eq(c1);
+          let (t, u) = self.dest_eq(c2);
+          let ft = self.alloc(Term::App(f, t));
+          let gu = self.alloc(Term::App(g, u));
+          let concl = self.mk_eq(ft, gu);
+          CProof { shyps: self.union(shyps1, shyps2), hyps: self.union(hyps1, hyps2), concl }
+        }
+        // Thm.equal_intr: from `A ⟹ B` and `B ⟹ A` infer `A ≡ B`
+        (proof::EqIntr, &[p, q]) => {
+          let CProof { shyps: shyps1, hyps: hyps1, concl: c1 } = self.ctx[m.proofs[&p]].0;
+          let CProof { shyps: shyps2, hyps: hyps2, concl: c2 } = self.ctx[m.proofs[&q]].0;
+          let (a1, b1) = self.dest_imp(c1);
+          let (b2, a2) = self.dest_imp(c2);
+          let mut cmp = Comparer::new(AConv);
+          cmp.apply(self, a1, a2);
+          cmp.apply(self, b1, b2);
+          let concl = self.mk_eq(a1, b1);
+          CProof { shyps: self.union(shyps1, shyps2), hyps: self.union(hyps1, hyps2), concl }
+        }
+        // Thm.equal_elim: from `A ≡ B` and `A` infer `B`
+        (proof::EqElim, &[p, q]) => {
+          let CProof { shyps: shyps1, hyps: hyps1, concl: c1 } = self.ctx[m.proofs[&p]].0;
+          let CProof { shyps: shyps2, hyps: hyps2, concl: c2 } = self.ctx[m.proofs[&q]].0;
+          let (a, b) = self.dest_eq(c1);
+          Comparer::new(AConv).apply(self, a, c2);
+          CProof { shyps: self.union(shyps1, shyps2), hyps: self.union(hyps1, hyps2), concl: b }
+        }
         (proof::FlexFlex, &[_, _]) => todo!(),
         (proof::Generalize, &[tfrees, frees, idx, p]) => {
           // `Names.set` is `int Table.table` (a 2-3 tree), not a list: exportSmall dumps the
@@ -805,6 +974,7 @@ impl<'a> Checker<'a> {
         (proof::Instantiate, &[tysubst, subst, p]) => {
           let mut inst = Mapper::new(InstTerm::new(
             Subst::from_assoc(&mut (&mut *self, &mut m), bp, tysubst, subst),
+            false,
             false,
           ));
           let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
@@ -882,24 +1052,73 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps, concl }
         }
-        (proof::IncrIndexes, &[_, _]) => todo!(),
+        // Thm.incr_indexes: raise every schematic index by `inc`; hyps and shyps are untouched
+        (proof::IncrIndexes, &[inc, p]) => {
+          let inc: u32 = self.parse(&mut m, bp, inc);
+          let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
+          let concl =
+            if inc == 0 { concl } else { Mapper::new(IncrIdx::new(inc)).apply(self, concl) };
+          CProof { shyps, hyps, concl }
+        }
         (proof::Assumption, &[_, _]) => todo!(),
         (proof::EqAssumption, &[_]) => todo!(),
         (proof::Rotate, &[_, _, _]) => todo!(),
         (proof::PermutePrems, &[_, _, _]) => todo!(),
+        // Thm.bicompose_aux: the rule `⟦rAs⟧ ⟹ B` is resolved against subgoal `Bi` of the
+        // state `⟦Bs; Bi⟧ ⟹ C`, giving `⟦Bs; As⟧ ⟹ C` under the unifier `env`.
+        // `p` proves the rule, `q` proves the state (thm.ML: deriv_rule2 … rder' sder).
         (proof::Bicompose, &[args, p, q]) => {
           let args: BicomposeArgs = self.parse(&mut m, bp, args);
-          let CProof { shyps: shyps1, hyps: hyps1, concl } = self.ctx[m.proofs[&p]].0;
-          let CProof { shyps: shyps2, hyps: hyps2, concl: lhs2 } = self.ctx[m.proofs[&q]].0;
-          let mut inst = Mapper::new(InstTerm::new(args.env, true));
+          let CProof { shyps: shyps1, hyps: hyps1, concl: rule } = self.ctx[m.proofs[&p]].0;
+          let CProof { shyps: shyps2, hyps: hyps2, concl: state } = self.ctx[m.proofs[&q]].0;
+          if args.n != 0 {
+            todo!("eresolution: discharge the rule's first premise against assumption {}", args.n)
+          }
+          assert!(args.tpairs.is_empty(), "flex-flex pairs are not carried by CProof");
+
+          // rule = ⟦rAs⟧ ⟹ B
+          let mut r_prems = vec![];
+          let mut b = rule;
+          for _ in 0..args.nsubgoal {
+            let (h, t) = self.dest_imp(b);
+            r_prems.push(h);
+            b = t
+          }
+          // state = ⟦Bs; Bi⟧ ⟹ C
+          let mut bs = vec![];
+          let mut st = state;
+          for _ in 0..args.nbs {
+            let (h, t) = self.dest_imp(st);
+            bs.push(h);
+            st = t
+          }
+          let (bi, c) = self.dest_imp(st);
+
+          let mut inst = Mapper::new(InstTerm::new(args.env, true, true));
+          // the unifier is what justifies replacing the subgoal by the rule's premises
+          let b = inst.apply(self, b);
+          let bi = inst.apply(self, bi);
+          Comparer::new(AConv).apply(self, b, bi);
+
+          let mut concl = inst.apply(self, c);
+          for &a in r_prems.iter().rev() {
+            let a = if args.flatten { self.flatten_params(args.n, a) } else { a };
+            let a = inst.apply(self, a);
+            concl = self.mk_imp(a, concl)
+          }
+          for &bj in bs.iter().rev() {
+            let bj = inst.apply(self, bj);
+            concl = self.mk_imp(bj, concl)
+          }
+
           let mut shyps = self.union(shyps1, shyps2);
-          for (_, _, ty) in inst.f.ty.f.subst {
+          for &(_, _, ty) in &inst.f.ty.f.subst {
             shyps = self.union(shyps, self.ctx[ty].1.sorts)
           }
-          let hyps = self.union(hyps1, hyps2);
-          let (lhs, concl) = self.dest_imp(concl);
-          Comparer::new(AConv).apply(self, lhs, lhs2);
-          CProof { shyps, hyps, concl }
+          for &(_, _, tm) in &inst.f.subst {
+            shyps = self.union(shyps, self.ctx[tm].1.sorts)
+          }
+          CProof { shyps, hyps: self.union(hyps1, hyps2), concl }
         }
         _ => panic!(),
       };
@@ -1115,12 +1334,16 @@ struct InstTerm {
   ty: Mapper<TypeId, InstType>,
   subst: Box<[(IndexNameId, TypeId, TermId)]>,
   beta: bool,
+  /// An `Envir` keys its `tenv` by the variable's type *before* type instantiation
+  /// (`Envir.norm_term1` looks the variable up as it stands in the term), whereas a
+  /// `Thm.instantiate` substitution is keyed by the instantiated type.
+  env_keys: bool,
 }
 impl InstTerm {
-  fn new(mut subst: Subst, beta: bool) -> Self {
+  fn new(mut subst: Subst, beta: bool, env_keys: bool) -> Self {
     let ty = Mapper::new(InstType::new(subst.tysubst));
     subst.subst.sort_by_key(|x| (x.0, x.1));
-    Self { ty, subst: subst.subst, beta }
+    Self { ty, subst: subst.subst, beta, env_keys }
   }
 }
 
@@ -1144,8 +1367,13 @@ impl Map<TermId> for InstTerm {
       }
       Term::Var(x, ty) => {
         let ty2 = inst.f.ty.apply(ck, ty);
-        match inst.f.subst.binary_search_by_key(&(x, ty2), |x| (x.0, x.1)) {
-          Ok(j) => inst.f.subst[j].2,
+        let key = if inst.f.env_keys { ty } else { ty2 };
+        match inst.f.subst.binary_search_by_key(&(x, key), |x| (x.0, x.1)) {
+          // `Envir.norm_term` normalises the result again: a unifier need not be idempotent
+          Ok(j) => {
+            let t = inst.f.subst[j].2;
+            inst.apply(ck, t)
+          }
           _ => ck.alloc(Term::Var(x, ty2)),
         }
       }
@@ -1302,6 +1530,40 @@ impl IncrBound {
   }
 }
 
+/// `Term.abstract_over`: replace a variable by the bound variable of a new abstraction.
+struct AbstractOver {
+  x: TermId,
+  map: HashMap<(TermId, u32), TermId>,
+}
+impl AbstractOver {
+  fn new(x: TermId) -> Self {
+    Self { x, map: HashMap::new() }
+  }
+
+  fn apply(&mut self, ck: &mut Checker<'_>, t: TermId, depth: u32) -> TermId {
+    if t == self.x {
+      return ck.alloc(Term::Bound(depth));
+    }
+    if let Some(&t) = self.map.get(&(t, depth)) {
+      return t;
+    }
+    let ret = match ck.ctx[t].0 {
+      Term::Abs(x, ty, e) => {
+        let e = self.apply(ck, e, depth + 1);
+        ck.alloc(Term::Abs(x, ty, e))
+      }
+      Term::App(f, a) => {
+        let f = self.apply(ck, f, depth);
+        let a = self.apply(ck, a, depth);
+        ck.alloc(Term::App(f, a))
+      }
+      _ => t,
+    };
+    self.map.insert((t, depth), ret);
+    ret
+  }
+}
+
 struct SubstBound<'a> {
   subst: &'a [TermId],
   inc: IncrBound,
@@ -1362,6 +1624,56 @@ impl Map<TypeId> for LiftVarsT {
     let Type::Type(c, tys) = ck.ctx[t].0 else { unreachable!() };
     let tys = tys.iter().map(|&t| inst.apply(ck, t)).collect::<Vec<_>>();
     ck.alloc_copy(&Type::Type(c, &tys))
+  }
+}
+
+/// `Logic.incr_indexes ([], inc)`: raise the index of every schematic variable, in terms
+/// and in the types inside them.
+struct IncrIdx {
+  ty: Mapper<TypeId, LiftVarsT>,
+  inc: u32,
+}
+impl IncrIdx {
+  fn new(inc: u32) -> Self {
+    Self { ty: Mapper::new(LiftVarsT { inc }), inc }
+  }
+}
+impl Map<TermId> for IncrIdx {
+  fn easy(_: &mut Mapper<TermId, Self>, ck: &mut Checker<'_>, t: TermId) -> Option<TermId> {
+    if matches!(ck.ctx[t].0, Term::Bound(_)) {
+      Some(t)
+    } else {
+      None
+    }
+  }
+  fn apply(inst: &mut Mapper<TermId, Self>, ck: &mut Checker<'_>, t: TermId) -> TermId {
+    match ck.ctx[t].0 {
+      Term::Const(c, ty) => {
+        let ty2 = inst.f.ty.apply(ck, ty);
+        ck.alloc(Term::Const(c, ty2))
+      }
+      Term::Free(x, ty) => {
+        let ty2 = inst.f.ty.apply(ck, ty);
+        ck.alloc(Term::Free(x, ty2))
+      }
+      Term::Var(x, ty) => {
+        let ty2 = inst.f.ty.apply(ck, ty);
+        let (name, i) = ck.ctx[x].0;
+        let x2 = ck.alloc((name, i + inst.f.inc));
+        ck.alloc(Term::Var(x2, ty2))
+      }
+      Term::Abs(x, ty, e) => {
+        let ty2 = inst.f.ty.apply(ck, ty);
+        let e2 = inst.apply(ck, e);
+        ck.alloc(Term::Abs(x, ty2, e2))
+      }
+      Term::App(t, u) => {
+        let t2 = inst.apply(ck, t);
+        let u2 = inst.apply(ck, u);
+        ck.alloc(Term::App(t2, u2))
+      }
+      Term::Bound(_) => unreachable!(),
+    }
   }
 }
 
@@ -1432,9 +1744,16 @@ impl LiftVars {
         let ty2 = self.lift.apply(ck, ty);
         ck.alloc(Term::Free(x, ty2))
       }
+      // `Logic.incr_indexes` lifts the types of constants too (`Const (c, incrT T)`);
+      // leaving them alone desynchronises a constant's type from its arguments'.
+      Term::Const(c, ty) => {
+        let ty2 = self.lift.apply(ck, ty);
+        ck.alloc(Term::Const(c, ty2))
+      }
       Term::Abs(x, ty, e) => {
+        let ty2 = self.lift.apply(ck, ty);
         let e2 = self.apply(ck, e, depth + 1);
-        ck.alloc(Term::Abs(x, ty, e2))
+        ck.alloc(Term::Abs(x, ty2, e2))
       }
       Term::App(t, u) => {
         let t2 = self.apply(ck, t, depth);
