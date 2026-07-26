@@ -1157,10 +1157,18 @@ impl<'a> Checker<'a> {
             false,
           ));
           let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
-          for &(_, _, ty) in &inst.f.ty.f.subst {
+          for &(v, vs, ty) in &inst.f.ty.f.subst.clone() {
+            if *DEBUG_BC {
+              println!("  [inst] tyvar {:?}:{:?} := {:?} contributing {:?}", self.pp(v),
+                self.pp(vs), self.pp(ty), self.pp(self.ctx[ty].1.sorts));
+            }
             shyps = self.union(shyps, self.ctx[ty].1.sorts);
           }
-          for &(_, _, tm) in &inst.f.subst {
+          for &(v, vt, tm) in &inst.f.subst.clone() {
+            if *DEBUG_BC {
+              println!("  [inst] var {:?}:{:?} := {:?} contributing {:?}", self.pp(v),
+                self.pp(vt), self.pp(tm), self.pp(self.ctx[tm].1.sorts));
+            }
             shyps = self.union(shyps, self.ctx[tm].1.sorts);
           }
           CProof { shyps, hyps, concl: inst.apply(self, concl) }
