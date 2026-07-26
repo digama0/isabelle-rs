@@ -909,6 +909,27 @@ impl<'a> Checker<'a> {
             println!("!! statement mismatch after rule {inner}");
             println!("   computed: {:?}", self.pp(cp.concl));
             println!("   recorded: {:?}", self.pp(recorded));
+            if inner == proof::Bicompose {
+              let (_, args) = bp.get_enum(p);
+              let a: BicomposeArgs = self.parse(&mut m, bp, args[0]);
+              for &(v, vs, ty) in &a.env.tysubst {
+                println!("   env tyvar {:?}:{:?} := {:?}", self.pp(v), self.pp(vs), self.pp(ty));
+              }
+              for &(v, vt, tm) in &a.env.subst {
+                println!("   env var   {:?}:{:?} := {:?}", self.pp(v), self.pp(vt), self.pp(tm));
+              }
+              println!("   nbs={} nsubgoal={} flatten={} n={}", a.nbs, a.nsubgoal, a.flatten, a.n);
+            }
+            if inner == proof::Instantiate {
+              let (_, args) = bp.get_enum(p);
+              let sub = Subst::from_assoc(&mut (&mut *self, &mut m), bp, args[0], args[1]);
+              for &(v, vs, ty) in &sub.tysubst {
+                println!("   tysubst {:?}:{:?} := {:?}", self.pp(v), self.pp(vs), self.pp(ty));
+              }
+              for &(v, vt, tm) in &sub.subst {
+                println!("   subst   {:?}:{:?} := {:?}", self.pp(v), self.pp(vt), self.pp(tm));
+              }
+            }
             panic!("statement mismatch at rule {inner}");
           }
 
@@ -1315,12 +1336,9 @@ impl<'a> Checker<'a> {
           assert!(args.tpairs.is_empty(), "flex-flex pairs are not carried by CProof");
 
           // rule = ⟦rAs⟧ ⟹ B
-          let mut r_prems = vec![];
           let mut b = rule;
           for _ in 0..args.nsubgoal {
-            let (h, t) = self.dest_imp(b);
-            r_prems.push(h);
-            b = t
+            b = self.dest_imp(b).1
           }
           // state = ⟦Bs; Bi⟧ ⟹ C
           let mut bs = vec![];
@@ -1346,8 +1364,12 @@ impl<'a> Checker<'a> {
           Comparer::new(AConv).apply(self, b, bi);
 
           let mut concl = inst.apply(self, c);
-          for &a in r_prems.iter().rev() {
-            let a = if args.flatten { self.flatten_params(args.n, a) } else { a };
+          // The new subgoals are the recorded `As`, not the rule's premises recomputed:
+          // `newAs` applies `rename_bvars` first, which renames the rule's *schematic*
+          // variables (and bound ones) to the goal's parameter names, and that renaming is
+          // recorded nowhere else.  TODO: check `As` against the rule's premises modulo
+          // that renaming, rather than taking them on trust.
+          for &a in args.as_.iter().rev() {
             let a = inst.apply(self, a);
             concl = self.mk_imp(a, concl)
           }
@@ -1631,10 +1653,16 @@ impl Map<TermId> for InstTerm {
         let ty2 = inst.f.ty.apply(ck, ty);
         let key = if inst.f.env_keys { ty } else { ty2 };
         match inst.f.subst.binary_search_by_key(&(x, key), |x| (x.0, x.1)) {
-          // `Envir.norm_term` normalises the result again: a unifier need not be idempotent
           Ok(j) => {
             let t = inst.f.subst[j].2;
-            inst.apply(ck, t)
+            // `Envir.norm_term` normalises the result again, since a unifier need not be
+            // idempotent; `Term_Subst.instantiate` does not -- it inserts the term as it
+            // stands, so a type variable inside it survives this substitution.
+            if inst.f.env_keys {
+              inst.apply(ck, t)
+            } else {
+              t
+            }
           }
           _ => ck.alloc(Term::Var(x, ty2)),
         }
