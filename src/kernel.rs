@@ -734,6 +734,20 @@ impl<'a> Checker<'a> {
     }
   }
 
+  /// `Name.clean_index`: an internal name carries one trailing `_` per index bump
+  /// (`Name.internal = suffix "_"`), so generalizing `uu_` at index 0 yields `?uu.1`.
+  fn clean_index(&mut self, x: StringId, idx: u32) -> IndexNameId {
+    let name = self.ctx[x].0;
+    let mut clean = name;
+    let mut i = idx;
+    while let Some(s) = clean.strip_suffix('_') {
+      clean = s;
+      i += 1
+    }
+    let x = if clean.len() == name.len() { x } else { self.alloc_copy(&clean) };
+    self.alloc((x, i))
+  }
+
   /// `Term.loose_bvar1 (t, lev)`: does the bound variable `lev` occur loose in `t`?
   fn loose_bvar1(&self, t: TermId, lev: u32) -> bool {
     match self.ctx[t].0 {
@@ -1709,7 +1723,7 @@ impl Map<TermId> for GenTerm {
       Term::Free(x, ty) => {
         let ty2 = inst.f.ty.apply(ck, ty);
         if inst.f.frees.binary_search(&x).is_ok() {
-          let x = ck.alloc((x, inst.f.ty.f.idx));
+          let x = ck.clean_index(x, inst.f.ty.f.idx);
           ck.alloc(Term::Var(x, ty2))
         } else {
           ck.alloc(Term::Free(x, ty2))
