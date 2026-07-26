@@ -851,9 +851,11 @@ impl<'a> Checker<'a> {
     ty
   }
 
+  /// hypotheses are propositions; the stronger "no schematic variables" condition belongs
+  /// to `Thm.assume` alone (`implies_intr` happily discharges a prop containing variables)
   fn check_hyp(&mut self, t: TermId) {
     let data = &self.ctx[t].1;
-    assert!(data.maxidx.0 == 0 && self.ctx[data.ty.unwrap()].0.as_type().0 == StringId::PROP);
+    assert!(self.ctx[data.ty.unwrap()].0.as_type().0 == StringId::PROP, "hypothesis is not a prop");
   }
 
   /// the `sorts` of the cterm a rule consumed: inherited through cterm operations, so it
@@ -968,6 +970,8 @@ impl<'a> Checker<'a> {
         (proof::Pruned, _) => panic!("encountered Pruned (prune_proofs?)"),
         (proof::Hyp, &[concl, sorts]) => {
           let concl: TermId = self.parse(&mut m, bp, concl);
+          // Thm.assume: "assume: variables" unless maxidx = ~1
+          assert!(self.ctx[concl].1.maxidx == MaxIdx::NONE, "assume: variables");
           let shyps = self.parse_sorts(&mut m, bp, sorts);
           let hyp = self.alloc(concl);
           CProof { shyps, hyps: self.alloc(IdxBitSet::single(hyp)), concl }
