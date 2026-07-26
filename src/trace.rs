@@ -324,8 +324,10 @@ pub mod proof {
   pub const Trans: u32 = 34;
   pub const Trivial: u32 = 35;
   pub const Varify: u32 = 36;
+  /// debug wrapper carrying the statement its subproof proves (option `prooftrace_props`)
+  pub const ZProp: u32 = 37;
 
-  pub const END: u32 = 37;
+  pub const END: u32 = 38;
 
   pub fn num_subproofs(tag: u32) -> usize {
     match tag {
@@ -333,7 +335,7 @@ pub mod proof {
       | OfClass | Thm | ConstrainThm | Pruned => 0,
       ImpIntr | ForallIntr | ForallElim | Symm | StripSHyps | AbsRule | FlexFlex | Generalize
       | Instantiate | Varify | LegacyFreezeT | Lift | IncrIndexes | Assumption | EqAssumption
-      | Rotate | PermutePrems => 1,
+      | Rotate | PermutePrems | ZProp => 1,
       ImpElim | Trans | AppRule | EqIntr | EqElim | Bicompose => 2,
       END.. => panic!(),
     }

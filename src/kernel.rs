@@ -714,6 +714,26 @@ impl<'a> Checker<'a> {
     self.try_dest_eq(a).expect("expected equality")
   }
 
+  /// Alpha-equivalence, without the panic of [`AConv`]: terms are hash-consed, so this is
+  /// only reached when bound-variable names differ.
+  fn aconv(&self, a: TermId, b: TermId, seen: &mut HashSet<(TermId, TermId)>) -> bool {
+    if a == b {
+      return true;
+    }
+    if !seen.insert((a, b)) {
+      return true;
+    }
+    match (&self.ctx[a].0, &self.ctx[b].0) {
+      (&Term::Abs(_, ty1, e1), &Term::Abs(_, ty2, e2)) => {
+        ty1 == ty2 && self.aconv(e1, e2, seen)
+      }
+      (&Term::App(f1, u1), &Term::App(f2, u2)) => {
+        self.aconv(f1, f2, seen) && self.aconv(u1, u2, seen)
+      }
+      _ => false,
+    }
+  }
+
   /// `Term.loose_bvar1 (t, lev)`: does the bound variable `lev` occur loose in `t`?
   fn loose_bvar1(&self, t: TermId, lev: u32) -> bool {
     match self.ctx[t].0 {
@@ -849,6 +869,20 @@ impl<'a> Checker<'a> {
     for pf in visited {
       #[allow(non_upper_case_globals)]
       let pf2 = match bp.get_enum(pf) {
+        // debug wrapper (option prooftrace_props): the statement its subproof proves, so a
+        // divergence is reported at the inference that caused it rather than at the end
+        (proof::ZProp, &[prop, p]) => {
+          let cp = self.ctx[m.proofs[&p]].0.clone();
+          let recorded: TermId = self.parse(&mut m, bp, prop);
+          if !self.aconv(recorded, cp.concl, &mut HashSet::new()) {
+            let inner = bp.get_enum(p).0;
+            println!("!! statement mismatch after rule {inner}");
+            println!("   computed: {:?}", self.pp(cp.concl));
+            println!("   recorded: {:?}", self.pp(recorded));
+            panic!("statement mismatch at rule {inner}");
+          }
+          cp
+        }
         (proof::Sorry, _) => panic!("encountered Sorry (unrecorded proof: promise/future?)"),
         (proof::Pruned, _) => panic!("encountered Pruned (prune_proofs?)"),
         (proof::Hyp, &[concl]) => {
@@ -966,6 +1000,16 @@ impl<'a> Checker<'a> {
         (proof::EtaLong, &[_]) => todo!(),
         (proof::StripSHyps, &[sorts, p]) => {
           let CProof { mut shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
+          if *DEBUG_STEPS {
+            let listed = bp
+              .parse_list(sorts)
+              .map(|s| {
+                let s: SortId = self.parse(&mut m, bp, s);
+                self.pp(s)
+              })
+              .collect::<Vec<_>>();
+            println!("       strip removes {:?} from {:?}", listed, self.pp(shyps));
+          }
           if sorts != TagPtr::ZERO {
             let mut newsorts = self.ctx[shyps].0.clone();
             for s in bp.parse_list(sorts) {
@@ -1224,7 +1268,8 @@ impl<'a> Checker<'a> {
       //   self.pp(pf2.concl)
       // );
       if *DEBUG_STEPS {
-        println!("  rule {:2} => {:?}", bp.get_enum(pf).0, self.pp(pf2.concl));
+        println!("  rule {:2} shyps={:?} => {:?}", bp.get_enum(pf).0, self.pp(pf2.shyps),
+          self.pp(pf2.concl));
       }
       m.proofs.insert(pf, self.alloc(pf2));
     }
