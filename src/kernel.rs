@@ -842,6 +842,19 @@ impl<'a> Checker<'a> {
     assert!(data.maxidx.0 == 0 && self.ctx[data.ty.unwrap()].0.as_type().0 == StringId::PROP);
   }
 
+  /// the `sorts` of the cterm a rule consumed: inherited through cterm operations, so it
+  /// cannot be recovered from the term itself and the exporter records it
+  fn parse_sorts<'b>(
+    &mut self, m: &mut Mapping, bp: &BinParser<'b>, sorts: TagPtr,
+  ) -> SortsId {
+    let mut bits = IdxBitSet::new();
+    for s in bp.parse_list(sorts) {
+      let s: SortId = self.parse(m, bp, s);
+      bits.insert(s);
+    }
+    self.alloc(bits)
+  }
+
   fn parse<'b, 'c, T: BinParse<'b, BM<'a, 'c>>>(
     &'c mut self, m: &'c mut Mapping, bp: &BinParser<'b>, p: TagPtr,
   ) -> T {
@@ -895,23 +908,25 @@ impl<'a> Checker<'a> {
           }
           let mut got = self.ctx[cp.shyps].0.clone();
           got.remove(SortId::TOP);
-          // Isabelle's shyps is an over-approximation carried along by cterm operations
-          // (Sorts.insert_term only ever adds, and Cterm.sorts is inherited), whereas this
-          // checker recomputes from the statement.  So the sets legitimately differ; report
-          // both directions rather than asserting, and distinguish them: sorts we invent
-          // that Isabelle never had are the ones that break the final unconstrain check.
+          // The sort hypotheses must match exactly: Isabelle's shyps is what the recorded
+          // constraints were derived from, so anything else makes the final unconstrain
+          // reconciliation meaningless.  Note this is *not* the same as recomputing the
+          // sorts of the statement -- Cterm.sorts is inherited through cterm operations, so
+          // a rule consuming a cterm contributes sorts that its term no longer mentions.
           if want != got {
             let invented =
               got.iter().filter(|&s| !want.contains(s)).map(|s| self.pp(s)).collect::<Vec<_>>();
             let dropped =
               want.iter().filter(|&s| !got.contains(s)).map(|s| self.pp(s)).collect::<Vec<_>>();
+            println!("!! sort hypotheses differ after rule {inner}");
             if !invented.is_empty() {
-              println!("!! rule {inner} invents sorts {invented:?} (recorded: {:?})",
-                want.iter().map(|s| self.pp(s)).collect::<Vec<_>>());
+              println!("   invented: {invented:?}");
             }
             if !dropped.is_empty() {
-              println!("?? rule {inner} drops sorts {dropped:?} that Isabelle carries");
+              println!("   dropped:  {dropped:?}");
             }
+            println!("   for:      {:?}", self.pp(cp.concl));
+            panic!("shyps mismatch at rule {inner}");
           }
 
           // we do not model flex-flex pairs yet: report rather than pass over them
@@ -923,18 +938,19 @@ impl<'a> Checker<'a> {
         }
         (proof::Sorry, _) => panic!("encountered Sorry (unrecorded proof: promise/future?)"),
         (proof::Pruned, _) => panic!("encountered Pruned (prune_proofs?)"),
-        (proof::Hyp, &[concl]) => {
+        (proof::Hyp, &[concl, sorts]) => {
           let concl: TermId = self.parse(&mut m, bp, concl);
-          let shyps = self.ctx[concl].1.sorts;
+          let shyps = self.parse_sorts(&mut m, bp, sorts);
           let hyp = self.alloc(concl);
           CProof { shyps, hyps: self.alloc(IdxBitSet::single(hyp)), concl }
         }
-        (proof::ImpIntr, &[t, p]) => {
+        (proof::ImpIntr, &[t, sorts, p]) => {
           let CProof { mut shyps, hyps, mut concl } = self.ctx[m.proofs[&p]].0;
           let t: TermId = self.parse(&mut m, bp, t);
           let mut hyps = self.ctx[hyps].0.clone();
-          let TermData { sorts, ty, .. } = self.ctx[t].1;
+          let TermData { ty, .. } = self.ctx[t].1;
           assert_eq!(ty, Ok(TypeId::PROP));
+          let sorts = self.parse_sorts(&mut m, bp, sorts);
           shyps = self.union(shyps, sorts);
           hyps.remove(self.alloc(t));
           concl = self.mk_imp(t, concl);
@@ -951,8 +967,9 @@ impl<'a> Checker<'a> {
         }
         // Thm.forall_intr: from `A` infer `⋀x. A`, x not free in the hypotheses.
         // shyps gains the sorts of x's type (`Sorts.union sorts shyps`).
-        (proof::ForallIntr, &[x, p]) => {
+        (proof::ForallIntr, &[x, sorts, p]) => {
           let x: TermId = self.parse(&mut m, bp, x);
+          let sorts = self.parse_sorts(&mut m, bp, sorts);
           let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
           if hyps != HypsId::EMPTY {
             let mut seen = HashSet::new();
@@ -966,16 +983,17 @@ impl<'a> Checker<'a> {
             _ => panic!("forall_intr: expected a variable"),
           };
           let ty = self.ctx[x].1.ty.unwrap();
-          let shyps = self.union(shyps, self.ctx[x].1.sorts);
+          let shyps = self.union(shyps, sorts);
           let body = AbstractOver::new(x).apply(self, concl, 0);
           CProof { shyps, hyps, concl: self.mk_forall(name, ty, body) }
         }
-        (proof::ForallElim, &[t, p]) => {
+        (proof::ForallElim, &[t, sorts, p]) => {
           let CProof { shyps, hyps, concl } = self.ctx[m.proofs[&p]].0;
           let t: TermId = self.parse(&mut m, bp, t);
           let (ty2, pred) = self.dest_forall(concl);
-          let TermData { sorts, ty, .. } = self.ctx[t].1;
+          let TermData { ty, .. } = self.ctx[t].1;
           assert_eq!(ty, Ok(ty2));
+          let sorts = self.parse_sorts(&mut m, bp, sorts);
           let shyps = self.union(shyps, sorts);
           let concl = if let Term::Abs(_, _, body) = self.ctx[pred].0 {
             SubstBound::new(&[t]).apply(self, body, 0)
@@ -992,10 +1010,11 @@ impl<'a> Checker<'a> {
           CProof { shyps, hyps: HypsId::EMPTY, concl }
         }
         (proof::Oracle, &[_, _]) => todo!(),
-        (proof::Refl, &[t]) => {
+        (proof::Refl, &[t, sorts]) => {
           let t = self.parse(&mut m, bp, t);
+          let shyps = self.parse_sorts(&mut m, bp, sorts);
           let concl = self.mk_eq(t, t);
-          CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
+          CProof { shyps, hyps: HypsId::EMPTY, concl }
         }
         // Thm.symmetric / Thm.transitive
         (proof::Symm, &[p]) => {
@@ -1013,27 +1032,30 @@ impl<'a> Checker<'a> {
           CProof { shyps: self.union(shyps1, shyps2), hyps: self.union(hyps1, hyps2), concl }
         }
         // Thm.beta_conversion true: `t ≡ Envir.beta_norm t`
-        (proof::BetaNorm, &[t]) => {
+        (proof::BetaNorm, &[t, sorts]) => {
           let t: TermId = self.parse(&mut m, bp, t);
+          let shyps = self.parse_sorts(&mut m, bp, sorts);
           let rhs = BetaNorm::new().apply(self, t);
           let concl = self.mk_eq(t, rhs);
-          CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
+          CProof { shyps, hyps: HypsId::EMPTY, concl }
         }
         // Thm.beta_conversion false: one step at the head, `(λx. b) u ≡ b[u]`
-        (proof::BetaHead, &[t]) => {
+        (proof::BetaHead, &[t, sorts]) => {
           let t: TermId = self.parse(&mut m, bp, t);
+          let shyps = self.parse_sorts(&mut m, bp, sorts);
           let (f, u) = self.dest_app(t);
           let Term::Abs(_, _, b) = self.ctx[f].0 else { panic!("beta_conversion: not a redex") };
           let rhs = SubstBound::new(&[u]).apply(self, b, 0);
           let concl = self.mk_eq(t, rhs);
-          CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
+          CProof { shyps, hyps: HypsId::EMPTY, concl }
         }
         // Thm.eta_conversion: `t ≡ Envir.eta_contract t`
-        (proof::Eta, &[t]) => {
+        (proof::Eta, &[t, sorts]) => {
           let t: TermId = self.parse(&mut m, bp, t);
+          let shyps = self.parse_sorts(&mut m, bp, sorts);
           let rhs = EtaContract::new().apply(self, t);
           let concl = self.mk_eq(t, rhs);
-          CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, concl }
+          CProof { shyps, hyps: HypsId::EMPTY, concl }
         }
         (proof::EtaLong, &[_]) => todo!(),
         (proof::StripSHyps, &[sorts, p]) => {
@@ -1164,16 +1186,8 @@ impl<'a> Checker<'a> {
         }
         (proof::Thm, &[_i]) => todo!(),
         (proof::ConstrainThm, &[_i, shyps, hyps, prop]) => {
-          // The referenced theorem was unconstrained: its sort hypotheses became OfClass
-          // premises, and the use site discharges them with PClass proofs
-          // (`argsP = map PClass (#outer_constraints ucontext) @ map Hyp hyps`).  They land
-          // in Isabelle's `constraints`, not in shyps -- exactly as the hypotheses become
-          // premises of `prop` rather than being inherited.  TODO: these are discharged
-          // obligations we do not yet verify (see the class-derivation gap for OfClass).
-          for s in bp.parse_list(shyps) {
-            let _: SortId = self.parse(&mut m, bp, s);
-          }
-          let shyps = SortsId::EMPTY;
+          // the referenced theorem's own sort hypotheses, which the using theorem inherits
+          let shyps = self.parse_sorts(&mut m, bp, shyps);
           let mut hyp_terms = vec![];
           let mut bits = IdxBitSet::new();
           for h in bp.parse_list(hyps) {
@@ -1208,11 +1222,12 @@ impl<'a> Checker<'a> {
           CProof { shyps, hyps, concl: inst.apply(self, concl) }
         }
         (proof::LegacyFreezeT, &[_]) => todo!(),
-        (proof::Lift, &[gprop, inc, p]) => {
+        (proof::Lift, &[gprop, inc, sorts, p]) => {
           let gprop: TermId = self.parse(&mut m, bp, gprop);
           let inc = self.parse(&mut m, bp, inc);
+          let sorts = self.parse_sorts(&mut m, bp, sorts);
           let CProof { mut shyps, hyps, mut concl } = self.ctx[m.proofs[&p]].0;
-          shyps = self.union(shyps, self.ctx[gprop].1.sorts);
+          shyps = self.union(shyps, sorts);
           let mut lift = LiftVars::new(self, gprop, inc);
           let mut spine = vec![];
           while let Some((e1, e2)) = self.try_dest_imp(concl) {
