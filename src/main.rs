@@ -407,6 +407,7 @@ fn short_name(s: &str) -> &str {
   }
 }
 
+#[derive(Clone)]
 enum Type {
   #[allow(clippy::enum_variant_names)]
   Type(String, Vec<Type>),
@@ -467,6 +468,7 @@ impl<'a> Parse<'a> for Type {
   }
 }
 
+#[derive(Clone)]
 enum Term {
   #[allow(clippy::enum_variant_names)]
   Const(String, Vec<Type>),
@@ -476,7 +478,9 @@ enum Term {
   Bound(u32),
   Abs(String, Box<Type>, Box<Term>),
   App(Box<Term>, Box<Term>),
-  OfClass(String, Box<Term>),
+  /// `OFCLASS(T, c)`: the payload is a *type*, which is why a nullary type constructor
+  /// used to parse as a `Const` by accident
+  OfClass(String, Box<Type>),
 }
 
 impl Term {
@@ -520,11 +524,7 @@ impl Term {
         rec_app(self, ctx, f)?;
         write!(f, ")")
       }
-      Term::OfClass(c, cs) => {
-        write!(f, "OfClass({}, ", short_name(c))?;
-        cs.dbg_fmt(ctx, f)?;
-        write!(f, ")")
-      }
+      Term::OfClass(c, ty) => write!(f, "OfClass({}, {ty:?})", short_name(c)),
     }
   }
 }
@@ -751,6 +751,7 @@ impl<'a> Parse<'a> for Proof {
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
 struct Prop {
   typargs: Vec<(String, Sort)>,
   args: Vec<(String, Box<Type>)>,
@@ -1040,7 +1041,9 @@ impl<'a> Parse<'a> for SpecRule {
 #[derive(Debug)]
 struct ClassEntry {
   params: Vec<(String, Box<Type>)>,
-  axioms: Vec<AxiomEntry>,
+  /// `encode_class` writes the class axioms as bare propositions -- unlike `theory/axioms`,
+  /// there is no provenance attached
+  axioms: Vec<Prop>,
 }
 impl<'a> Parse<'a> for ClassEntry {
   fn parse(t: &[Tree<'a>]) -> Self {
@@ -1217,6 +1220,251 @@ pub struct Global {
   proofs: HashMap<u32, ProofBox>,
   traces: HashMap<u32, Trace>,
   axioms: HashMap<String, Axiom>,
+  /// what each *checked* theorem proves, so that a citation of it (`Thm`, `ConstrainThm`)
+  /// can be verified rather than trusted.  Terms are interned per theorem, so the
+  /// statement is kept as a tree and reified into whichever checker needs it.
+  pub verified: HashMap<u32, VerifiedThm>,
+  /// theorems belonging to a parent session, which this run does not re-check: a citation
+  /// of one has to be taken on trust
+  pub external: HashSet<u32>,
+  /// the theory's class algebra: `Sorts.algebra` as the checker needs it
+  pub classes: ClassAlgebra,
+  /// declared constants: name ↦ (its type argument names, its type)
+  pub(crate) consts: HashMap<String, (Vec<String>, Type)>,
+  /// declared type constructors: name ↦ arity
+  pub types: HashMap<String, usize>,
+  /// what each axiom states, so that a trace citing one by name can be held to it
+  pub(crate) axiom_props: HashMap<String, Prop>,
+}
+
+/// `Sorts.algebra`, in the form `Sorts.of_sort` needs: the class inclusions, closed under
+/// transitivity, and the arities, completed under those inclusions the way
+/// `insert_complete_ars` does.
+#[derive(Default)]
+pub struct ClassAlgebra {
+  /// class ↦ that class and everything it entails
+  pub supers: HashMap<String, HashSet<String>>,
+  /// (type constructor, class) ↦ the argument sorts a type of that class must have
+  pub arities: HashMap<(String, String), Vec<Vec<String>>>,
+}
+
+impl ClassAlgebra {
+  /// `Sorts.class_le`
+  pub fn class_le(&self, c1: &str, c2: &str) -> bool {
+    c1 == c2 || self.supers.get(c1).is_some_and(|s| s.contains(c2))
+  }
+
+  /// `Sorts.sort_le`: every class of `s2` is entailed by some class of `s1`
+  pub fn sort_le(&self, s1: &[String], s2: &[String]) -> bool {
+    s2.iter().all(|c2| s1.iter().any(|c1| self.class_le(c1, c2)))
+  }
+
+  fn add_classrel(&mut self, c1: &str, c2: &str) {
+    self.supers.entry(c1.to_owned()).or_default().insert(c2.to_owned());
+    self.supers.entry(c2.to_owned()).or_default();
+  }
+
+  /// transitive closure of the class inclusions, then `complete`/`insert` of the declared
+  /// arities: an arity for `c` is also an arity for every superclass of `c`, and where two
+  /// candidates for the same `(t, c)` are comparable the *weaker* domain wins (a more
+  /// general arity), which is what `Sorts.insert` keeps
+  fn close(&mut self, arities: Vec<(String, Vec<Vec<String>>, String)>) {
+    let keys: Vec<String> = self.supers.keys().cloned().collect();
+    loop {
+      let mut changed = false;
+      for c in &keys {
+        let mut sup = self.supers[c].clone();
+        let n = sup.len();
+        for d in self.supers[c].clone() {
+          if let Some(s) = self.supers.get(&d) {
+            sup.extend(s.iter().cloned())
+          }
+        }
+        if sup.len() != n {
+          changed = true;
+          self.supers.insert(c.clone(), sup);
+        }
+      }
+      if !changed {
+        break
+      }
+    }
+    for (t, dom, c) in arities {
+      let mut cs = vec![c.clone()];
+      cs.extend(self.supers.get(&c).into_iter().flatten().cloned());
+      for c in cs {
+        let key = (t.clone(), c);
+        match self.arities.get(&key) {
+          None => {
+            self.arities.insert(key, dom.clone());
+          }
+          Some(old) => {
+            // keep the more general domain, as `Sorts.insert` does
+            let old = old.clone();
+            let new_is_weaker =
+              old.len() == dom.len() && (old.iter().zip(&dom)).all(|(a, b)| self.sort_le(a, b));
+            if new_is_weaker {
+              self.arities.insert(key, dom.clone());
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// The statement a checked theorem was verified against, in the `unconstrainT`-ed form the
+/// exporter records: `⟦OFCLASS(?'a, c); …⟧ ⟹ prop`, with the map from the theorem's own
+/// type variables to the stripped ones.
+///
+/// Kept as a flat encoding rather than a term tree: a session has hundreds of thousands of
+/// these live at once (a theorem is only dropped when nothing can cite it any more), and a
+/// tree of `String`-carrying nodes costs two orders of magnitude more.
+/// a node of the definitional dependency graph: a constant, plus the head constructors of
+/// its type arguments so that overloaded definitions are kept apart
+type DefNode = (String, Vec<Option<String>>);
+
+struct Definition {
+  lhs: DefNode,
+  rhs: Vec<DefNode>,
+}
+
+/// `Theory.add_def`'s conditions on a definitional axiom: it equates a constant (applied to
+/// distinct variables) with a right-hand side that introduces nothing new -- no free
+/// variables beyond the arguments, no type variables beyond the constant's.
+fn check_definition(g: &Global, prop: &Prop) -> Result<Definition, String> {
+  fn head_of(ty: &Type) -> Option<String> {
+    match ty {
+      Type::Type(c, _) => Some(c.clone()),
+      _ => None,
+    }
+  }
+  fn node(c: &str, tyargs: &[Type]) -> DefNode {
+    (c.to_owned(), tyargs.iter().map(head_of).collect())
+  }
+  fn consts_of(t: &Term, out: &mut Vec<DefNode>, frees: &mut Vec<String>) {
+    match t {
+      Term::Const(c, tyargs) => out.push(node(c, tyargs)),
+      Term::Const2(c, _) => out.push((c.clone(), vec![])),
+      Term::Free(x, _) => frees.push(x.clone()),
+      Term::Var(x, _, _) => frees.push(x.clone()),
+      Term::Abs(_, _, e) => consts_of(e, out, frees),
+      Term::App(f, u) => {
+        consts_of(f, out, frees);
+        consts_of(u, out, frees)
+      }
+      _ => {}
+    }
+  }
+  // `⋀`/`Trueprop` wrappers, then the equation
+  let mut t = &*prop.prop;
+  loop {
+    match t {
+      Term::App(f, u) => match &**f {
+        Term::Const(c, _) | Term::Const2(c, _) if c == "HOL.Trueprop" || c == "Pure.prop" => t = u,
+        _ => break,
+      },
+      _ => break,
+    }
+  }
+  let Term::App(f, rhs) = t else { return Err("not an equation".into()) };
+  let Term::App(eq, lhs) = &**f else { return Err("not an equation".into()) };
+  match &**eq {
+    Term::Const(c, _) | Term::Const2(c, _) if c == "Pure.eq" || c == "HOL.eq" => {}
+    _ => return Err("not an equation".into()),
+  }
+  // the left-hand side: a constant applied to distinct variables
+  let mut args = vec![];
+  // a class definition takes its type argument as `TYPE('a)`, which `Logic.dest_def` treats
+  // as a type argument rather than a term one
+  let mut type_args = vec![];
+  let mut head = &**lhs;
+  while let Term::App(f, u) = head {
+    match &**u {
+      Term::Free(x, _) | Term::Var(x, _, _) => args.push(x.clone()),
+      Term::Const(c, tys) if c == "Pure.type" => match &tys[..] {
+        [Type::Free(x, _) | Type::Var(x, _, _)] => type_args.push(x.clone()),
+        _ => return Err("TYPE argument is not a type variable".into()),
+      },
+      other => return Err(format!("left-hand side argument is not a variable: {other:?}")),
+    }
+    head = f
+  }
+  let (c, tyargs) = match head {
+    Term::Const(c, tyargs) => (c.clone(), tyargs.clone()),
+    Term::Const2(c, _) => (c.clone(), vec![]),
+    // `Axclass.define_class` defines the class predicate, which the export writes as an
+    // `OFCLASS` rather than as the constant `c_class` it is
+    Term::OfClass(c, ty) => (format!("{c}_class"), vec![(**ty).clone()]),
+    _ => return Err("left-hand side is not a constant".into()),
+  };
+  {
+    let mut seen = HashSet::new();
+    if !args.iter().all(|a| seen.insert(a.clone())) {
+      return Err("repeated argument on the left-hand side".into())
+    }
+    let mut seen = HashSet::new();
+    if !type_args.iter().all(|a| seen.insert(a.clone())) {
+      return Err("repeated TYPE argument on the left-hand side".into())
+    }
+  }
+  if !g.consts.contains_key(&c) {
+    return Err(format!("defines undeclared constant {c}"))
+  }
+  // the right-hand side introduces nothing new
+  let (mut rhs_consts, mut rhs_frees) = (vec![], vec![]);
+  consts_of(rhs, &mut rhs_consts, &mut rhs_frees);
+  if let Some(x) = rhs_frees.iter().find(|x| !args.contains(x)) {
+    return Err(format!("right-hand side has a free variable {x}"))
+  }
+  let mut lhs_tvars = type_args.clone();
+  for ty in &tyargs {
+    tvars_of(ty, &mut lhs_tvars)
+  }
+  let mut rhs_tvars = vec![];
+  tvars_of_term(rhs, &mut rhs_tvars);
+  if let Some(x) = rhs_tvars.iter().find(|x| !lhs_tvars.contains(x)) {
+    return Err(format!("right-hand side has a type variable {x} the constant does not"))
+  }
+  Ok(Definition { lhs: node(&c, &tyargs), rhs: rhs_consts })
+}
+
+fn tvars_of(ty: &Type, out: &mut Vec<String>) {
+  match ty {
+    Type::Type(_, args) => args.iter().for_each(|a| tvars_of(a, out)),
+    Type::Free(x, _) | Type::Var(x, _, _) => {
+      if !out.contains(x) {
+        out.push(x.clone())
+      }
+    }
+  }
+}
+
+fn tvars_of_term(t: &Term, out: &mut Vec<String>) {
+  match t {
+    Term::Const(_, tys) => tys.iter().for_each(|a| tvars_of(a, out)),
+    Term::Const2(_, ty) => tvars_of(ty, out),
+    Term::Free(_, Some(ty)) => tvars_of(ty, out),
+    Term::Var(_, _, Some(ty)) => tvars_of(ty, out),
+    Term::Abs(_, ty, e) => {
+      tvars_of(ty, out);
+      tvars_of_term(e, out)
+    }
+    Term::App(f, u) => {
+      tvars_of_term(f, out);
+      tvars_of_term(u, out)
+    }
+    Term::OfClass(_, ty) => tvars_of(ty, out),
+    _ => {}
+  }
+}
+
+pub struct VerifiedThm {
+  /// the names this statement mentions, indexed by the encoding
+  pub strings: Vec<String>,
+  pub buf: Vec<u8>,
+  /// `-1` for a promise trace (see `ThmTrace::unconstrain_shyps`)
+  pub n_ofclass: i32,
 }
 
 fn maybe_decompress(compressed: bool, blob: &[u8]) -> Cow<'_, [u8]> {
@@ -1240,6 +1488,7 @@ impl Global {
     let mut q = db.prepare("select * from isabelle_exports")?;
     let mut rows = q.query(())?;
     let mut data = Box::new(Session::default());
+    let mut warned: HashSet<String> = Default::default();
     while let Some(row) = rows.next()? {
       #[derive(Debug)]
       enum RowType<'a> {
@@ -1303,6 +1552,21 @@ impl Global {
       };
       let blob = maybe_decompress(row.get(4)?, row.get_ref(5)?.as_blob()?);
       let blob = parse(&blob);
+      if std::env::var_os("SHOW_ROWS").is_some() {
+        eprintln!("row {name:?}");
+      }
+      // The checker consumes a handful of export kinds; the rest are parsed only because
+      // they are there, and their formats drift.  A parse failure in one of those is a
+      // warning, not the end of the run -- but the ones the checker relies on stay strict.
+      let essential = matches!(
+        name,
+        RowType::Axioms(_)
+          | RowType::Thms(_)
+          | RowType::Classes(_)
+          | RowType::ClassRels(_)
+          | RowType::Arities(_)
+      );
+      let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       match name {
         RowType::Types(theory) => data.types.push((theory.to_owned(), <_>::parse(&blob))),
         RowType::Consts(theory) => data.consts.push((theory.to_owned(), <_>::parse(&blob))),
@@ -1319,8 +1583,12 @@ impl Global {
         RowType::ConstDefs(theory) => data.const_defs.push((theory.to_owned(), <_>::parse(&blob))),
         RowType::SpecRules(theory) => data.spec_rules.push((theory.to_owned(), <_>::parse(&blob))),
         RowType::Classes(theory) => data.classes.push((theory.to_owned(), <_>::parse(&blob))),
-        RowType::ClassRels(theory) => data.class_rels.push((theory.to_owned(), <_>::parse(&blob))),
-        RowType::Arities(theory) => data.arities.push((theory.to_owned(), <_>::parse(&blob))),
+        RowType::ClassRels(theory) => {
+          data.class_rels.push((theory.to_owned(), <_>::parse(&blob)))
+        }
+        RowType::Arities(theory) => {
+          data.arities.push((theory.to_owned(), <_>::parse(&blob)))
+        }
         RowType::Locales(theory) => data.locales.push((theory.to_owned(), <_>::parse(&blob))),
         RowType::LocaleDeps(theory) => {
           data.locale_deps.push((theory.to_owned(), <_>::parse(&blob)))
@@ -1329,6 +1597,13 @@ impl Global {
         RowType::Datatypes(theory) => data.datatypes.push((theory.to_owned(), <_>::parse(&blob))),
         RowType::Other(theory, kind) => {
           data.other.push((theory.to_owned(), kind.to_owned(), <_>::parse(&blob)))
+        }
+      }
+      }));
+      if parsed.is_err() {
+        assert!(!essential, "cannot parse {name:?}");
+        if warned.insert(format!("{name:?}").split('(').next().unwrap_or("").to_owned()) {
+          eprintln!("warning: cannot parse {name:?}, ignoring this export kind")
         }
       }
     }
@@ -1345,6 +1620,17 @@ thread_local! {
 }
 
 fn main() -> Result<()> {
+  // the checker recurses over terms (reification, eta expansion, sort checks), and HOL has
+  // terms deep enough to overflow the default 8M stack
+  std::thread::Builder::new()
+    .stack_size(1 << 30)
+    .spawn(run)
+    .expect("spawn")
+    .join()
+    .expect("checker thread")
+}
+
+fn run() -> Result<()> {
   // record panics instead of printing them: the driver keeps going and reports a summary
   std::panic::set_hook(Box::new(|info| {
     let msg = info
@@ -1354,6 +1640,9 @@ fn main() -> Result<()> {
       .or_else(|| info.payload().downcast_ref::<&str>().map(|s| (*s).to_owned()))
       .unwrap_or_else(|| "?".to_owned());
     let loc = info.location().map_or_else(String::new, |l| format!("{}:{}", l.file(), l.line()));
+    if std::env::var_os("SHOW_PANIC").is_some() {
+      eprintln!("panicked at {loc}: {msg}\n{}", std::backtrace::Backtrace::force_capture());
+    }
     LAST_PANIC.with(|p| *p.borrow_mut() = (msg, loc));
   }));
   let isabelle_root = std::path::PathBuf::from("/home/mario/Documents/isabelle");
@@ -1382,6 +1671,120 @@ fn main() -> Result<()> {
     parents.push((*sess, g.load_session(sess, false)?));
   }
   let sess = g.load_session(main, true)?;
+  {
+    // the class algebra of the session and everything it builds on
+    let mut arities = vec![];
+    let mut n_exported = 0usize;
+    for sess in parents.iter().map(|(_, y)| y).chain(std::iter::once(&sess)) {
+      for e in sess.class_rels.iter().flat_map(|(_, x)| x) {
+        g.classes.add_classrel(&e.c1, &e.c2)
+      }
+      for (_, entities) in &sess.classes {
+        for e in entities {
+          g.classes.supers.entry(e.name.clone()).or_default();
+        }
+      }
+      for e in sess.arities.iter().flat_map(|(_, x)| x) {
+        n_exported += 1;
+        arities.push((e.type_name.clone(), e.domain.clone(), e.codomain.clone()))
+      }
+      // `theory/classrel` and `theory/arities` are only written for what
+      // `Sorts.dest_algebra` reports as new in a theory, which in practice is nothing: the
+      // facts arrive as *axioms* tagged `ClassRel`/`Arity`, in the `unconstrainT`-ed form
+      // where the sorts of the type variables have become `OFCLASS` premises.
+      // Arities and class relations reach us as facts of the form
+      // `⟦OFCLASS(?'a, c1); …⟧ ⟹ OFCLASS(T, c)`: either axioms tagged `Arity`/`ClassRel`,
+      // or *theorems* (an `instance` proof), which this run checks like any other.
+      // not only the `Arity`/`ClassRel`-tagged ones: `HOL.fun_arity` and `HOL.itself_arity`
+      // are plain `axiomatization`s, and the shape is what identifies them anyway
+      let axiom_props =
+        (sess.axioms.iter().flat_map(|(_, x)| x)).filter_map(|e| e.val.0.as_deref()).map(|(p, _)| p);
+      // *not* theorem statements: plenty of theorems mention `OFCLASS` without declaring
+      // an arity, and a wrong entry here would let a bogus sort obligation through
+      for prop in axiom_props {
+        let mut constraints: HashMap<&str, Vec<String>> = Default::default();
+        let mut t: &Term = &prop.prop;
+        while let Term::App(f, arg) = t {
+          let Term::App(imp, prem) = &**f else { break };
+          let is_imp = match &**imp {
+            Term::Const(c, _) | Term::Const2(c, _) => c == "Pure.imp",
+            _ => false,
+          };
+          if !is_imp {
+            break
+          }
+          let Term::OfClass(c, carrier) = &**prem else { break };
+          let (Type::Var(x, _, _) | Type::Free(x, _)) = &**carrier else { break };
+          constraints.entry(x).or_default().push(c.clone());
+          t = arg
+        }
+        // the carrier of `OFCLASS(T, c)` is `T` written as a term: a type constructor
+        // becomes `Const (name, type args)`, a type variable a `Var`
+        let Term::OfClass(c, carrier) = t else { continue };
+        match &**carrier {
+          // `Logic.mk_arity (t, Ss, c) = OFCLASS(t(?'a1::S1, …), c)`
+          Type::Type(name, args) => {
+            let dom = (args.iter())
+              .map(|a| match a {
+                Type::Var(x, _, s) | Type::Free(x, s) => {
+                  let mut cs = constraints.get(&**x).cloned().unwrap_or_default();
+                  cs.extend(s.iter().cloned());
+                  cs
+                }
+                _ => vec![],
+              })
+              .collect::<Vec<_>>();
+            arities.push((name.clone(), dom, c.clone()))
+          }
+          // `Logic.mk_classrel (c1, c2) = OFCLASS(?'a::c1, c2)`: the sort is on the
+          // variable itself here, since a classrel axiom has no premises
+          Type::Var(x, _, sort) | Type::Free(x, sort) => {
+            let mut cs = constraints.get(&**x).cloned().unwrap_or_default();
+            cs.extend(sort.iter().cloned());
+            for c1 in cs {
+              g.classes.add_classrel(&c1, c)
+            }
+          }
+        }
+      }
+    }
+    let n = arities.len();
+    g.classes.close(arities);
+    // the declarations every term is checked against: a `Const (c, T)` must have `T` an
+    // instance of `c`'s declared type, and a type constructor must be applied to its arity
+    for sess in parents.iter().map(|(_, y)| y).chain(std::iter::once(&sess)) {
+      for (_, entities) in &sess.consts {
+        for e in entities {
+          if let Some(v) = e.val.0.as_deref() {
+            if v.abbrev.is_none() {
+              g.consts.insert(e.name.clone(), (v.args.clone(), v.ty.clone()));
+            }
+          }
+        }
+      }
+      for (_, entities) in &sess.types {
+        for e in entities {
+          if let Some(v) = e.val.0.as_deref() {
+            g.types.insert(e.name.clone(), v.args.len());
+          }
+        }
+      }
+      for (_, entities) in &sess.axioms {
+        for e in entities {
+          if let Some((prop, _)) = e.val.0.as_deref() {
+            g.axiom_props.insert(e.name.clone(), prop.clone());
+          }
+        }
+      }
+    }
+    if std::env::var_os("SHOW_ALGEBRA").is_some() {
+      println!("-- class algebra: {} classes, {n} declared arities ({} from exports), {} completed",
+        g.classes.supers.len(), n_exported, g.classes.arities.len());
+      for ((t, c), dom) in g.classes.arities.iter().take(8) {
+        println!("   arity {t} :: {dom:?} -> {c}");
+      }
+    }
+  }
   for (name, sess) in parents.iter().map(|(x, y)| (*x, y)).chain(std::iter::once((main, &sess))) {
     for (i, (_, axioms)) in sess.axioms.iter().enumerate() {
       let i = i as u32;
@@ -1492,18 +1895,33 @@ fn main() -> Result<()> {
     for (j, (_, thms)) in sess.thms.iter().enumerate() {
       for (k, thm) in thms.iter().enumerate() {
         gthms.insert(thm.serial, (i, j, k));
+        g.external.insert(thm.serial);
       }
     }
   }
   // for (&i, p) in &g.proofs {
   //   println!("proofs/{i}: {p:#?}")
   // }
+  let mut defs: Vec<(String, Definition)> = vec![];
+  let (mut n_unchecked, mut n_bad_defs) = (0usize, 0usize);
   for entity in sess.axioms.iter().flat_map(|(_, x)| x) {
     match entity.val.0.as_deref() {
       None => panic!("axiom {} not exported", entity.name),
       Some((_, AxiomReason::Forgot)) => panic!("axiom missing provenance"),
-      Some((_, AxiomReason::Def { unchecked: false, overloaded: _ })) => {
-        // todo: definition checking
+      Some((prop, AxiomReason::Def { unchecked, overloaded })) => {
+        match check_definition(&g, prop) {
+          Ok(def) => {
+            if *unchecked {
+              n_unchecked += 1
+            }
+            let _ = overloaded;
+            defs.push((entity.name.clone(), def))
+          }
+          Err(msg) => {
+            println!("!! definition {}: {msg}", entity.name);
+            n_bad_defs += 1
+          }
+        }
       }
       Some((_, AxiomReason::Axiom)) => {
         println!("user axiom {}: {:?}", entity.name, entity.val.0.as_deref().unwrap().0.prop)
@@ -1529,6 +1947,53 @@ fn main() -> Result<()> {
       Some((_, r)) => todo!("reason: {r:?}"),
     }
   }
+  {
+    // `Defs.define`: a definition may not depend on itself, directly or through others.
+    // Overloading makes the node a constant *plus* the head constructors of its type
+    // arguments, which is how Isabelle keeps `size :: 'a list ⇒ nat` and
+    // `size :: nat ⇒ nat` apart.
+    let mut edges: HashMap<DefNode, Vec<DefNode>> = Default::default();
+    for (_, d) in &defs {
+      edges.entry(d.lhs.clone()).or_default().extend(d.rhs.iter().cloned());
+    }
+    let mut state: HashMap<DefNode, u8> = Default::default();
+    let mut cycles = 0usize;
+    let mut stack: Vec<(DefNode, usize)> = vec![];
+    for start in edges.keys().cloned().collect::<Vec<_>>() {
+      if state.get(&start).is_some() {
+        continue
+      }
+      stack.push((start.clone(), 0));
+      state.insert(start, 1);
+      while let Some((n, i)) = stack.pop() {
+        let next = edges.get(&n).and_then(|v| v.get(i)).cloned();
+        match next {
+          None => {
+            state.insert(n, 2);
+          }
+          Some(m) => {
+            stack.push((n, i + 1));
+            match state.get(&m) {
+              Some(1) => {
+                println!("!! definitional cycle at {m:?}");
+                cycles += 1;
+              }
+              Some(_) => {}
+              None => {
+                state.insert(m.clone(), 1);
+                stack.push((m, 0));
+              }
+            }
+          }
+        }
+      }
+    }
+    println!(
+      "definitions: {} checked ({n_unchecked} unchecked), {n_bad_defs} malformed, {cycles} cyclic",
+      defs.len()
+    );
+    assert!(n_bad_defs == 0 && cycles == 0, "definition checking failed");
+  }
   #[derive(Debug)]
   enum Uses {
     Once,
@@ -1537,72 +2002,169 @@ fn main() -> Result<()> {
   }
   enum Elem {
     Start(u32),
-    Finish(Box<(Vec<u32>, Box<[u32]>, TagPtr)>),
+    /// the trace is decoded again rather than carried: the stack holds one entry per
+    /// theorem whose dependencies are still being checked, and a decoded trace is large
+    Finish(u32),
   }
   let mut checked = 0usize;
-  let mut failures: HashMap<(String, String), usize> = Default::default();
+  // count, and the id of the first theorem that hit it -- enough to reproduce one
+  let mut failures: HashMap<(String, String), (usize, u32)> = Default::default();
   let mut reachable: HashSet<u32> = Default::default();
   let mut uses: HashMap<u32, Uses> = Default::default();
   let mut stack: Vec<Elem> = vec![];
+  let mut deps_cache: HashMap<u32, Vec<u32>> = Default::default();
+  let mut starts = 0usize;
   for i in sess.thms.iter().rev().flat_map(|(_, e)| e.iter().rev()).map(|e| e.serial) {
     if g.traces.contains_key(&i) {
       uses.insert(i, Uses::Public);
-      if reachable.insert(i) {
-        stack.push(Elem::Start(i));
-      }
+      reachable.insert(i);
+      stack.push(Elem::Start(i));
     }
   }
   while let Some(elem) = stack.pop() {
     match elem {
       Elem::Start(i) => {
-        let blob = g.traces[&i].decode();
-        let (bp, root) = BinParser::new(&blob);
-        let mut thms = ThmTrace::get_uses(&bp, root);
-        let mut todo = vec![];
-        for j in thms {
-          if !gthms.contains_key(&j) {
-            match uses.entry(j) {
-              std::collections::hash_map::Entry::Occupied(mut e) => {
-                if let Uses::Once = *e.get() {
-                  e.insert(Uses::Multiple);
-                }
-              }
-              std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(Uses::Once);
-              }
-            }
-            if reachable.insert(j) {
-              todo.push(j)
+        // A theorem must be checked exactly once, and only once every theorem it cites has
+        // been checked -- a citation is verified against what its target was verified to
+        // prove.  A dependency reachable from several users must therefore not simply be
+        // marked visited (it could then be finished *after* one of them); instead the user
+        // is re-scheduled behind its outstanding dependencies.  The dependency list is
+        // memoised so that re-scheduling costs no further decoding.
+        if g.verified.contains_key(&i) {
+          continue
+        }
+        starts += 1;
+        if starts % 200000 == 0 && std::env::var_os("SHOW_MEM").is_some() {
+          println!("-- {starts} starts, {} decoded, stack {}", deps_cache.len(), stack.len());
+        }
+        if starts == 20_000_000 {
+          // a cycle in the citation graph would spin here forever: report it
+          let mut top: Vec<u32> = vec![];
+          for e in stack.iter().rev().take(40) {
+            if let Elem::Start(j) = e {
+              top.push(*j)
             }
           }
+          println!("!! traversal not converging; pending: {top:?}");
+          for j in top.iter().take(6) {
+            println!("   {j} cites {:?}", deps_cache.get(j));
+          }
+          std::process::exit(3)
         }
-        if !todo.is_empty() {
-          stack.push(Elem::Finish(Box::new((bp.pack(), blob, root))));
+        let deps = match deps_cache.get(&i) {
+          Some(deps) => deps,
+          None => {
+            let blob = g.traces[&i].decode();
+            let (bp, root) = BinParser::new(&blob);
+            let mut deps = vec![];
+            for j in ThmTrace::get_uses(&bp, root) {
+              if !gthms.contains_key(&j) {
+                match uses.entry(j) {
+                  std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if let Uses::Once = *e.get() {
+                      e.insert(Uses::Multiple);
+                    }
+                  }
+                  std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(Uses::Once);
+                  }
+                }
+                reachable.insert(j);
+                deps.push(j)
+              }
+            }
+            deps_cache.entry(i).or_insert(deps)
+          }
+        };
+        let todo: Vec<u32> =
+          deps.iter().copied().filter(|j| !g.verified.contains_key(j)).collect();
+        if todo.is_empty() {
+          stack.push(Elem::Finish(i))
+        } else {
+          stack.push(Elem::Start(i));
           stack.extend(todo.into_iter().rev().map(Elem::Start))
         }
       }
-      Elem::Finish(elem) => {
-        let (bp, blob, root) = *elem;
-        let bp = BinParser::unpack(&blob, bp);
+      Elem::Finish(i) => {
+        if g.verified.contains_key(&i) {
+          continue
+        }
+        let blob = g.traces[&i].decode();
+        let (bp, root) = BinParser::new(&blob);
         // keep going after a failure: one panic per run makes each investigation cost a
         // full pass over the session
+        // `ONLY=<serial>` restricts the check to one theorem, for investigating a failure
+        // (its dependencies are separate traces, so nothing else is needed)
+        // `ONLY=<serial>` restricts checking to one theorem; the others are recorded with
+        // what they claim so that citations still resolve and the traversal converges
+        if std::env::var("ONLY").is_ok_and(|v| v.parse() != Ok(i)) {
+          if let Ok(v) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Checker::new(&bumpalo::Bump::new(), &g).claim(&bp, root)
+          })) {
+            g.verified.insert(i, v);
+          }
+          continue
+        }
+        if checked % 20000 == 0 && std::env::var_os("SHOW_MEM").is_some() {
+          let bytes: usize =
+            g.verified.values().map(|v| v.buf.len() + v.strings.iter().map(|s| s.len() + 24).sum::<usize>()).sum();
+          let rss = std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split(' ').nth(1).and_then(|x| x.parse::<usize>().ok()))
+            .unwrap_or(0) * 4096;
+          println!("-- {checked} checked, {} stored, {} MB of statements, RSS {} MB",
+            g.verified.len(), bytes >> 20, rss >> 20);
+        }
+        if std::env::var_os("SHOW_START").is_some() {
+          println!("-> checking {i}");
+          use std::io::Write;
+          std::io::stdout().flush().ok();
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
           Checker::new(&bumpalo::Bump::new(), &g).check(&bp, root)
         }));
         checked += 1;
-        if result.is_err() {
-          let (msg, loc) = LAST_PANIC.with(|p| p.borrow().clone());
-          *failures.entry((loc, msg)).or_insert(0) += 1;
+        // record what this theorem proves, so that citations of it can be checked against
+        // it rather than trusted
+        match result {
+          Ok(v) => {
+            g.verified.insert(i, v);
+          }
+          Err(_) => {
+            let (msg, loc) = LAST_PANIC.with(|p| p.borrow().clone());
+            let e = failures.entry((loc, msg)).or_insert((0, i));
+            e.0 += 1;
+            if std::env::var_os("SHOW_FAILS").is_some() {
+              println!("   ^^ failure in proof_trace/{i}");
+            }
+            // record what it *claims* to prove, so that its users are checked against that
+            // and the failure is reported once, where it happened
+            if let Ok(v) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+              Checker::new(&bumpalo::Bump::new(), &g).claim(&bp, root)
+            })) {
+              g.verified.insert(i, v);
+            }
+          }
         }
       }
     }
   }
-  let failed: usize = failures.values().sum();
+  if std::env::var_os("DEBUG_RULES").is_some() {
+    kernel::RULE_COUNTS.with(|c| {
+      let c = c.borrow();
+      let mut rows: Vec<_> = c.iter().enumerate().filter(|&(_, &n)| n != 0).collect();
+      rows.sort_by_key(|&(_, &n)| std::cmp::Reverse(n));
+      for (tag, n) in rows {
+        println!("{n:10}  rule {tag}");
+      }
+    })
+  }
+  let failed: usize = failures.values().map(|x| x.0).sum();
   println!("\n=== checked {checked} theorems, {failed} failed ===");
   let mut rows: Vec<_> = failures.into_iter().collect();
-  rows.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-  for ((loc, msg), n) in rows {
-    println!("{n:6}  {loc}  {msg}");
+  rows.sort_by_key(|&(_, (n, _))| std::cmp::Reverse(n));
+  for ((loc, msg), (n, first)) in rows {
+    println!("{n:6}  {loc}  {msg}  (e.g. proof_trace/{first})");
   }
   Ok(())
 }

@@ -207,10 +207,17 @@ pub struct BicomposeArgs {
   /// number of state premises before the subgoal being replaced (`length Bs` in
   /// `Thm.bicompose_aux`), without which the new premises cannot be spliced in
   pub nbs: u32,
+  /// the state's `maxidx`: `Envir.above env smax` decides how much of the result
+  /// `Thm.bicompose_aux` bothers to normalise ("minimal copying")
+  pub smax: i32,
+  /// whether the rule was lifted over the subgoal's parameters and assumptions, which
+  /// shortens the disagreement pair (`strip_assums2`) and lets the first `nlift`
+  /// assumptions of each new subgoal be left alone (`norm_term_skip`)
+  pub lifted: bool,
 }
 impl<C: IdMapping> BinParse<'_, C> for BicomposeArgs {
   fn parse(ctx: &mut C, bp: &BinParser<'_>, p: TagPtr) -> Self {
-    let &[env, tpairs, nsubgoal, flatten, as_, a_, n, nlift, nbs] =
+    let &[env, tpairs, nsubgoal, flatten, as_, a_, n, nlift, nbs, smax, lifted] =
       bp.get(p.as_ptr()).as_tuple_n();
     Self {
       env: Subst::from_env(ctx, bp, env),
@@ -222,6 +229,8 @@ impl<C: IdMapping> BinParse<'_, C> for BicomposeArgs {
       n: bp.parse(ctx, n),
       nlift: bp.parse(ctx, nlift),
       nbs: bp.parse(ctx, nbs),
+      smax: smax.as_int(),
+      lifted: bp.parse(ctx, lifted),
     }
   }
 }
@@ -314,28 +323,32 @@ pub mod proof {
   pub const OfClass: u32 = 24;
   pub const Oracle: u32 = 25;
   pub const PermutePrems: u32 = 26;
-  pub const Pruned: u32 = 27;
-  pub const Refl: u32 = 28;
-  pub const Rotate: u32 = 29;
-  pub const Sorry: u32 = 30;
-  pub const StripSHyps: u32 = 31;
-  pub const Symm: u32 = 32;
-  pub const Thm: u32 = 33;
-  pub const Trans: u32 = 34;
-  pub const Trivial: u32 = 35;
-  pub const Varify: u32 = 36;
+  /// a forked proof, standing in for the trace exported under the promise's serial
+  pub const Promise: u32 = 27;
+  pub const Pruned: u32 = 28;
+  pub const Refl: u32 = 29;
+  pub const Rotate: u32 = 30;
+  pub const Sorry: u32 = 31;
+  pub const StripSHyps: u32 = 32;
+  pub const Symm: u32 = 33;
+  pub const Thm: u32 = 34;
+  pub const Trans: u32 = 35;
+  pub const Trivial: u32 = 36;
+  pub const Varify: u32 = 37;
+  /// `Thm.weaken`: add a hypothesis (and its cterm's sorts) without touching the statement
+  pub const Weaken: u32 = 38;
   /// debug wrapper carrying the statement its subproof proves (option `prooftrace_props`)
-  pub const ZProp: u32 = 37;
+  pub const ZProp: u32 = 39;
 
-  pub const END: u32 = 38;
+  pub const END: u32 = 40;
 
   pub fn num_subproofs(tag: u32) -> usize {
     match tag {
       Sorry | Hyp | Axiom | Oracle | Refl | BetaNorm | BetaHead | Eta | EtaLong | Trivial
-      | OfClass | Thm | ConstrainThm | Pruned => 0,
+      | OfClass | Thm | ConstrainThm | Promise | Pruned => 0,
       ImpIntr | ForallIntr | ForallElim | Symm | StripSHyps | AbsRule | FlexFlex | Generalize
       | Instantiate | Varify | LegacyFreezeT | Lift | IncrIndexes | Assumption | EqAssumption
-      | Rotate | PermutePrems | ZProp => 1,
+      | Rotate | PermutePrems | Weaken | ZProp => 1,
       ImpElim | Trans | AppRule | EqIntr | EqElim | Bicompose => 2,
       END.. => panic!(),
     }
@@ -488,7 +501,9 @@ pub struct ThmTrace {
   pub header: Header,
   pub root: ProofPtr,
   pub unconstrain_var_map: Vec<(TypeId, TypeId)>,
-  pub unconstrain_shyps: u32,
+  /// how many `OFCLASS` premises `unconstrainT` put in front of the statement, or `-1` for
+  /// a promise trace, whose sort hypotheses are declared rather than discharged
+  pub unconstrain_shyps: i32,
   pub unconstrain_hyps: Vec<TermId>,
 }
 impl<C: IdMapping> BinParse<'_, C> for ThmTrace {
@@ -505,7 +520,7 @@ impl<C: IdMapping> BinParse<'_, C> for ThmTrace {
       header: bp.parse(ctx, header),
       root,
       unconstrain_var_map: bp.parse(ctx, uc_var_map),
-      unconstrain_shyps: bp.parse(ctx, uc_shyps),
+      unconstrain_shyps: uc_shyps.as_int(),
       unconstrain_hyps: bp.parse(ctx, uc_hyps),
     }
   }
@@ -522,7 +537,7 @@ impl ThmTrace {
         let (tag, args) = bp.get_enum(p);
         let i = proof::num_subproofs(tag);
         if i == 0 {
-          if let proof::Thm | proof::ConstrainThm = tag {
+          if let proof::Thm | proof::ConstrainThm | proof::Promise = tag {
             thms.insert(args[0].as_uint());
           }
         } else {
