@@ -1959,6 +1959,15 @@ impl<'a> Checker<'a> {
         println!("  -> rule {}", bp.get_enum(pf).0);
       }
       let pf2 = match bp.get_enum(pf) {
+        /// `Prooftrace.prop_proof` -- not a rule but the debug wrapper `tag_thm` puts around *every*
+        /// inference when option `prooftrace_props` is on.  It records what the wrapped inference
+        /// produced: its statement, its sort hypotheses and its flex-flex pairs.
+        ///
+        /// Checked here: the statement `aconv` (alpha only -- no beta, no eta); the sort hypotheses
+        /// *exactly*, as sets, after dropping the trivial sort `[]` on both sides (an unconstrained
+        /// type variable contributes it and the final `unconstrain` reconciliation skips it too); and
+        /// the flex-flex pairs pairwise in order, each side up to alpha.  Nothing else about the
+        /// wrapped inference is re-derived here -- it has already been checked by its own arm.
         (proof::ZProp, &[prop, shyps, tpairs, p]) => {
           let cp = self.ctx[m.proofs[&p]].0.clone();
           let inner = bp.get_enum(p).0;
@@ -2058,6 +2067,12 @@ impl<'a> Checker<'a> {
           }
           cp
         }
+        /// `Prooftrace.sorry`: the derivation slot of a theorem whose proof was never recorded --
+        /// `empty_deriv`, a `Thm.future` promise that this fork now records as [`proof::Promise`]
+        /// instead, or tracing switched on part-way through a session.  Fatal: a checked theorem may
+        /// not rest on an unrecorded proof.  The parent inference is reported, since with
+        /// `prooftrace_props` on it is a `ZProp` carrying the statement of the step that went
+        /// unrecorded.
         (proof::Sorry, _) => {
           // find who has this Sorry as a subproof: with `prooftrace_props` on, the parent
           // is a ZProp carrying the statement of the step that went unrecorded
@@ -2087,7 +2102,18 @@ impl<'a> Checker<'a> {
           tr.header.command_pos.line,
         )
         }
+        /// `Prooftrace.pruned`: `Proofterm.prune_body` threw the proof away (option `prune_proofs`).
+        /// Fatal for the same reason as `Sorry`.
         (proof::Pruned, _) => panic!("encountered Pruned (prune_proofs?)"),
+        /// `Thm.assume ct`, recording the cterm's term and its `sorts`.
+        ///
+        /// Conditions: `maxidx = ~1`, i.e. the proposition has no schematic variables (ML raises
+        /// "assume: variables"); and it has type `prop` (checked when the hypothesis is interned).
+        ///
+        /// Result `A ⊢ A`: `shyps` are the *recorded* cterm sorts rather than the sorts of the term --
+        /// cterm sorts are inherited through cterm operations and cannot be recomputed; `hyps = {A}`,
+        /// interned under canonicalised binder names because ML's hypothesis set is an `Ord_List` over
+        /// `Term_Ord.fast_term_ord`, which does not compare `Abs` names; no flex-flex pairs.
         (proof::Hyp, &[concl, sorts]) => {
           let concl: TermId = self.parse(&mut m, bp, concl);
           // Thm.assume: "assume: variables" unless maxidx = ~1
@@ -2101,6 +2127,14 @@ impl<'a> Checker<'a> {
             concl,
           }
         }
+        /// `Thm.implies_intr ct`, recording the cterm's term `A` and its `sorts`.
+        ///
+        /// Conditions: `A :: prop`.
+        ///
+        /// Result `A ⟹ B`: `hyps` loses `A` (ML's `remove_hyps` is an `Ord_List` delete, so it removes
+        /// an alpha-variant too, which is why hyps are interned canonically); `shyps` gains the cterm
+        /// sorts (`Sorts.union sorts shyps`); the flex-flex pairs pass through.  Nothing is
+        /// normalised.
         (proof::ImpIntr, &[t, sorts, p]) => {
           let CProof { mut shyps, hyps, tpairs, mut concl } = self.ctx[m.proofs[&p]].0;
           let t: TermId = self.parse(&mut m, bp, t);
@@ -2113,6 +2147,13 @@ impl<'a> Checker<'a> {
           concl = self.mk_imp(t, concl);
           CProof { shyps, hyps: self.alloc(hyps), tpairs, concl }
         }
+        /// `Thm.implies_elim`: `p` proves `A ⟹ B` and `q` proves `A'`.
+        ///
+        /// Condition: `A aconv A'` (ML: `A aconv propA`) -- alpha only, no beta or eta.
+        ///
+        /// Result `B`: `shyps` and `hyps` are unioned; the flex-flex pairs are merged with
+        /// `union_tpairs`, which keeps the first list and appends the entries of the second that are
+        /// not already there up to alpha.
         (proof::ImpElim, &[p, q]) => {
           let CProof { shyps: shyps1, hyps: hyps1, tpairs: tp1, concl } = self.ctx[m.proofs[&p]].0;
           let CProof { shyps: shyps2, hyps: hyps2, tpairs: tp2, concl: lhs2 } = self.ctx[m.proofs[&q]].0;
@@ -2124,6 +2165,16 @@ impl<'a> Checker<'a> {
           Comparer::new(AConv).apply(self, lhs, lhs2);
           CProof { shyps, hyps, tpairs, concl }
         }
+        /// `Thm.forall_intr ct`, recording the variable `x` (a `Free` or a `Var`) and the cterm's
+        /// `sorts`.
+        ///
+        /// Condition: the eigenvariable condition, which ML states differently for the two cases --
+        /// `check_result a hyps` for a `Free`, but `check_result a []` for a `Var`, so for a schematic
+        /// variable only the flex-flex pairs are scanned and the hypotheses are deliberately not.
+        ///
+        /// Result `⋀x. A`, built as `Logic.all_const T $ Abs (a, T, abstract_over (x, A))`: the binder
+        /// name comes from the variable (a `Var`'s indexname base), the type from the cterm.  `shyps`
+        /// gains the cterm sorts; hyps and flex-flex pairs pass through; nothing is normalised.
         (proof::ForallIntr, &[x, sorts, p]) => {
           let x: TermId = self.parse(&mut m, bp, x);
           let sorts = self.parse_sorts(&mut m, bp, sorts);
@@ -2145,6 +2196,14 @@ impl<'a> Checker<'a> {
           let body = AbstractOver::new(x).apply(self, concl, 0);
           CProof { shyps, hyps, tpairs, concl: self.mk_forall(name, ty, body) }
         }
+        /// `Thm.forall_elim ct`, recording the instance term `t` and the cterm's `sorts`.
+        ///
+        /// Conditions: the premise is `⋀x::T. A` and `t :: T` (ML raises `THM ("forall_elim: type
+        /// mismatch")`).
+        ///
+        /// Result: `Term.betapply` -- a *single* beta step substituting `t` for the bound variable,
+        /// with `incr_boundvars` applied to `t` under binders.  The body is not normalised further.
+        /// `shyps` gains the cterm sorts.
         (proof::ForallElim, &[t, sorts, p]) => {
           let CProof { shyps, hyps, tpairs, concl } = self.ctx[m.proofs[&p]].0;
           let t: TermId = self.parse(&mut m, bp, t);
@@ -2160,6 +2219,19 @@ impl<'a> Checker<'a> {
           };
           CProof { shyps, hyps, tpairs, concl }
         }
+        /// `Thm.axiom' thy (name, src)`, recording the axiom's name, the proposition stored for it in
+        /// `Theory.axiom_table`, and the `Theory.axiom_source` (whether it was cited by name or picked
+        /// up by `all_axioms_of`; the source is not otherwise used).
+        ///
+        /// Condition: the session must declare an axiom of that name, stating exactly this.  The
+        /// comparison canonicalises both sides first, because `theory/axioms` exports the statement
+        /// through `standard_prop`, which renames the schematic variables, writes them as `Free`s,
+        /// lifts their sorts out into `typargs` and renames bound variables away from them: every
+        /// schematic term and type variable is renumbered by order of first occurrence, binder names
+        /// are erased, and the sorts are put back from `typargs`.
+        ///
+        /// Result: `shyps` are the statement's own sorts (`Sorts.insert_term prop []`), no hypotheses,
+        /// no flex-flex pairs.
         (proof::Axiom, &[name, concl, _src]) => {
           let name: StringId = self.parse(&mut m, bp, name);
           let concl: TermId = self.parse(&mut m, bp, concl);
@@ -2186,6 +2258,14 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps: HypsId::EMPTY, tpairs: TpairsId::EMPTY, concl }
         }
+        /// `Thm.oracle`, recording the oracle's name, the proposition it claims, and the cterm's
+        /// `sorts`.
+        ///
+        /// Nothing about the claim is checkable -- that is what an oracle is.  The theorem is accepted;
+        /// recording it is what lets a reader see that a proof depends on an oracle and which one.
+        ///
+        /// Condition: the proposition has type `prop`.  Result: `shyps` are the recorded cterm sorts,
+        /// no hypotheses, no flex-flex pairs, and `constraints = []`.
         (proof::Oracle, &[name, t, sorts]) => {
           let name: StringId = self.parse(&mut m, bp, name);
           let concl: TermId = self.parse(&mut m, bp, t);
@@ -2196,17 +2276,26 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps: HypsId::EMPTY, tpairs: TpairsId::EMPTY, concl }
         }
+        /// `Thm.reflexive ct`, recording the term and the cterm's `sorts`.  Result `t ≡ t`, built by
+        /// `Logic.mk_equals`, whose `Pure.eq` takes its type from the left-hand side.
         (proof::Refl, &[t, sorts]) => {
           let t = self.parse(&mut m, bp, t);
           let shyps = self.parse_sorts(&mut m, bp, sorts);
           let concl = self.mk_eq(t, t);
           CProof { shyps, hyps: HypsId::EMPTY, tpairs: TpairsId::EMPTY, concl }
         }
+        /// `Thm.symmetric`: from `t ≡ u` infer `u ≡ t`.  Nothing is normalised; `shyps`, `hyps` and
+        /// the flex-flex pairs pass through unchanged.
         (proof::Symm, &[p]) => {
           let CProof { shyps, hyps, tpairs, concl } = self.ctx[m.proofs[&p]].0;
           let (t, u) = self.dest_eq(concl);
           CProof { shyps, hyps, tpairs, concl: self.mk_eq(u, t) }
         }
+        /// `Thm.transitive`: from `t ≡ u` and `u' ≡ v` infer `t ≡ v`.
+        ///
+        /// Condition: `u aconv u'` (ML raises `THM ("transitive: middle term")`) -- alpha only.
+        ///
+        /// `shyps` and `hyps` are unioned, the flex-flex pairs merged with `union_tpairs`.
         (proof::Trans, &[p, q]) => {
           let CProof { shyps: shyps1, hyps: hyps1, tpairs: tp1, concl: c1 } = self.ctx[m.proofs[&p]].0;
           let CProof { shyps: shyps2, hyps: hyps2, tpairs: tp2, concl: c2 } = self.ctx[m.proofs[&q]].0;
@@ -2218,6 +2307,12 @@ impl<'a> Checker<'a> {
           CProof { shyps: self.union(shyps1, shyps2), hyps: self.union(hyps1, hyps2),
             tpairs: self.union_tpairs(tp1, tp2), concl }
         }
+        /// `Thm.beta_conversion true ct`, recording the term and the cterm's `sorts`.
+        ///
+        /// Result `t ≡ Envir.beta_norm t`: the *full* beta normal form.  `beta_norm` is `norm_term`
+        /// with an empty environment, so it contracts every redex, including ones already present
+        /// rather than only those a substitution created, and re-normalises the result of each
+        /// contraction.  No eta.
         (proof::BetaNorm, &[t, sorts]) => {
           let t: TermId = self.parse(&mut m, bp, t);
           let shyps = self.parse_sorts(&mut m, bp, sorts);
@@ -2225,6 +2320,13 @@ impl<'a> Checker<'a> {
           let concl = self.mk_eq(t, rhs);
           CProof { shyps, hyps: HypsId::EMPTY, tpairs: TpairsId::EMPTY, concl }
         }
+        /// `Thm.beta_conversion false ct`, recording the term and the cterm's `sorts`.
+        ///
+        /// Condition: the term is a redex at the head, `(λx. b) u` (ML raises `THM ("beta_conversion:
+        /// not a redex")`).
+        ///
+        /// Result `t ≡ b[u/x]`: exactly *one* step, at the head only.  The result is not normalised
+        /// further, and no eta.
         (proof::BetaHead, &[t, sorts]) => {
           let t: TermId = self.parse(&mut m, bp, t);
           let shyps = self.parse_sorts(&mut m, bp, sorts);
@@ -2234,6 +2336,11 @@ impl<'a> Checker<'a> {
           let concl = self.mk_eq(t, rhs);
           CProof { shyps, hyps: HypsId::EMPTY, tpairs: TpairsId::EMPTY, concl }
         }
+        /// `Thm.eta_conversion ct`, recording the term and the cterm's `sorts`.
+        ///
+        /// Result `t ≡ Envir.eta_contract t`: full eta contraction.  As in ML, the body is contracted
+        /// first and `λx. f x` collapses to `f` only when `x` does not occur in `f`
+        /// (`Term.is_dependent`/`loose_bvar1 f 0`), with the loose bounds of `f` decremented.
         (proof::Eta, &[t, sorts]) => {
           let t: TermId = self.parse(&mut m, bp, t);
           let shyps = self.parse_sorts(&mut m, bp, sorts);
@@ -2241,6 +2348,13 @@ impl<'a> Checker<'a> {
           let concl = self.mk_eq(t, rhs);
           CProof { shyps, hyps: HypsId::EMPTY, tpairs: TpairsId::EMPTY, concl }
         }
+        /// `Thm.eta_long_conversion ct`, recording the term and the cterm's `sorts`.
+        ///
+        /// Result `t ≡ Envir.eta_long [] t`: the long eta normal form -- every subterm is eta-expanded
+        /// to the arity of its type, and a redex at the head is beta-normalised first.  The types of
+        /// loose bound variables come from the enclosing binders (`fastype_of1`), so the conversion is
+        /// carried out against the interned local context, which also lets it be memoised: the terms
+        /// are hash-consed DAGs and expanding one as a tree is exponential.
         (proof::EtaLong, &[t, sorts]) => {
           let t: TermId = self.parse(&mut m, bp, t);
           let shyps = self.parse_sorts(&mut m, bp, sorts);
@@ -2249,6 +2363,14 @@ impl<'a> Checker<'a> {
           let concl = self.mk_eq(t, rhs);
           CProof { shyps, hyps: HypsId::EMPTY, tpairs: TpairsId::EMPTY, concl }
         }
+        /// `Thm.strip_shyps`, recording the sorts that were *removed* -- ML computes them as
+        /// `Sorts.subtract extra' extra`, the sorts witnessed away by `Sorts.witness_sorts` (the
+        /// minimised ones it kept are `extra'`).
+        ///
+        /// Result: `shyps` loses exactly those; statement, hypotheses and flex-flex pairs are
+        /// untouched.  The reconstruction `shyps' = shyps \ removed` is only equal to ML's
+        /// `present ∪ extra'` while every sort in `shyps` is already minimal, which is what the
+        /// comment at `thm.ML`'s `strip_shyps` asserts.
         (proof::StripSHyps, &[sorts, p]) => {
           let CProof { mut shyps, hyps, tpairs, concl } = self.ctx[m.proofs[&p]].0;
           if *DEBUG_STEPS {
@@ -2271,6 +2393,16 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps, tpairs, concl }
         }
+        /// `Thm.abstract_rule (b, x) ct`, recording the variable `x` and the cterm's `sorts` (this
+        /// fork added the sorts: ML's `abstract_rule_proof` recorded only the variable, so the
+        /// `Sorts.union sorts shyps` could not be reproduced).
+        ///
+        /// Conditions: the premise is an equation `t ≡ u`; and the eigenvariable condition, which as
+        /// for `forall_intr` scans the hypotheses only when `x` is a `Free` -- for a `Var`, ML checks
+        /// the flex-flex pairs alone.
+        ///
+        /// Result `(λb. t) ≡ (λb. u)` with `Term.abstract_over`, the binder named `b` from the trace
+        /// and typed from the cterm.  `shyps` gains the cterm sorts; nothing is normalised.
         (proof::AbsRule, &[x, sorts, p]) => {
           let x: TermId = self.parse(&mut m, bp, x);
           // `Thm.abstract_rule` inherits the abstracted cterm's sorts
@@ -2299,6 +2431,11 @@ impl<'a> Checker<'a> {
           let g = self.alloc(Term::Abs(name, ty, u));
           CProof { shyps, hyps, tpairs, concl: self.mk_eq(f, g) }
         }
+        /// `Thm.combination`: from `f ≡ g` and `t ≡ u` infer `f t ≡ g u`.
+        ///
+        /// Condition: the types agree -- `f : tT → _`, which is ML's `THM ("combination: types")`.
+        ///
+        /// `shyps` and `hyps` are unioned, the flex-flex pairs merged; nothing is normalised.
         (proof::AppRule, &[p, q]) => {
           let CProof { shyps: shyps1, hyps: hyps1, tpairs: tp1, concl: c1 } = self.ctx[m.proofs[&p]].0;
           let CProof { shyps: shyps2, hyps: hyps2, tpairs: tp2, concl: c2 } = self.ctx[m.proofs[&q]].0;
@@ -2313,6 +2450,11 @@ impl<'a> Checker<'a> {
           CProof { shyps: self.union(shyps1, shyps2), hyps: self.union(hyps1, hyps2),
             tpairs: self.union_tpairs(tp1, tp2), concl }
         }
+        /// `Thm.equal_intr`: from `A ⟹ B` and `B' ⟹ A'` infer `A ≡ B`.
+        ///
+        /// Conditions: `A aconv A'` and `B aconv B'` -- alpha only.
+        ///
+        /// `shyps` and `hyps` are unioned, the flex-flex pairs merged.
         (proof::EqIntr, &[p, q]) => {
           let CProof { shyps: shyps1, hyps: hyps1, tpairs: tp1, concl: c1 } = self.ctx[m.proofs[&p]].0;
           let CProof { shyps: shyps2, hyps: hyps2, tpairs: tp2, concl: c2 } = self.ctx[m.proofs[&q]].0;
@@ -2326,6 +2468,11 @@ impl<'a> Checker<'a> {
           CProof { shyps: self.union(shyps1, shyps2), hyps: self.union(hyps1, hyps2),
             tpairs: self.union_tpairs(tp1, tp2), concl }
         }
+        /// `Thm.equal_elim`: from `A ≡ B` and `A'` infer `B`.
+        ///
+        /// Condition: `A aconv A'` -- alpha only.
+        ///
+        /// `shyps` and `hyps` are unioned, the flex-flex pairs merged.
         (proof::EqElim, &[p, q]) => {
           let CProof { shyps: shyps1, hyps: hyps1, tpairs: tp1, concl: c1 } = self.ctx[m.proofs[&p]].0;
           let CProof { shyps: shyps2, hyps: hyps2, tpairs: tp2, concl: c2 } = self.ctx[m.proofs[&q]].0;
@@ -2335,6 +2482,18 @@ impl<'a> Checker<'a> {
           CProof { shyps: self.union(shyps1, shyps2), hyps: self.union(hyps1, hyps2),
             tpairs: self.union_tpairs(tp1, tp2), concl: b }
         }
+        /// `Thm.flexflex_rule`, recording the environment `Unify.smash_unifiers` produced for the
+        /// theorem's flex-flex pairs.
+        ///
+        /// If the environment is empty ML returns the theorem unchanged, and so does this arm.
+        /// Otherwise the statement and both sides of every pair are normalised by `Envir.norm_term`
+        /// (full beta, re-normalising what it substitutes since a unifier need not be idempotent, and
+        /// applying the type environment, which is chained for the same reason), the pairs that
+        /// normalisation made trivial are dropped (`filter_out (op aconv)`), and `shyps` gains the
+        /// sorts of the types the environment assigns -- `Envir.insert_sorts` folds over the *type*
+        /// environment only.
+        ///
+        /// Condition: every `?'a::S := T` in that type environment satisfies `of_sort (norm T, S)`.
         (proof::FlexFlex, &[env, p]) => {
           let env = Subst::from_env(&mut (&mut *self, &mut m), bp, env);
           let empty_env = env.tysubst.is_empty() && env.subst.is_empty();
@@ -2364,6 +2523,22 @@ impl<'a> Checker<'a> {
             CProof { shyps, hyps, tpairs, concl }
           }
         }
+        /// `Thm.generalize (tfrees, frees) idx`, recording the two `Names.set`s and the index.  Note
+        /// a `Names.set` is an `int Table.table`, a 2-3 tree, and `exportSmall` dumps the tree itself
+        /// rather than the flattened list the old XML encoder produced.
+        ///
+        /// Condition: `idx > maxidx`, without which the freshly created `Var (x, idx)` could collide
+        /// with a schematic variable already in the statement (ML raises "generalize: bad index").  ML
+        /// compares against the *theorem's* maxidx, which also covers its flex-flex pairs; the checker
+        /// compares against the statement's, so it accepts a little more than ML.
+        ///
+        /// Result: each listed type free becomes `TVar ((a, idx), S)` -- a bare `(a, idx)`, no
+        /// `clean_index` -- and each listed term free `Var (Name.clean_index (x, idx), T)`, where
+        /// `clean_index` moves each trailing underscore of an internal name into the index.  The
+        /// statement *and* the flex-flex pairs are generalized.
+        ///
+        /// Not checked: ML's "generalize: variable free in assumptions", i.e. that no generalized free
+        /// occurs in the hypotheses.
         (proof::Generalize, &[tfrees, frees, idx, p]) => {
           // `Names.set` is `int Table.table` (a 2-3 tree), not a list: exportSmall dumps the
           // table itself, where the old XML encoder flattened it via `Names.dest`.
@@ -2384,6 +2559,28 @@ impl<'a> Checker<'a> {
           let tpairs = self.map_tpairs(&mut |ck, t| inst.apply(ck, t), tpairs);
           CProof { shyps, hyps, tpairs, concl: inst.apply(self, concl) }
         }
+        /// `Thm.instantiate` or `Thm.instantiate_beta` -- one rule for both, with a flag saying which.
+        /// Records the type substitution, the term substitution, the resulting `shyps'`, and `beta`.
+        ///
+        /// The four data fields are grouped in an explicit tuple because Poly/ML inlines a
+        /// constructor's arguments into its cell only up to four and boxes the whole payload beyond
+        /// that, subproofs included.
+        ///
+        /// Condition: every `?'a::S := U` satisfies `of_sort (U, S)`, which is `make_instT`'s
+        /// `Sign.of_sort thy (U, S)`.
+        ///
+        /// Substitution: `Thm.instantiate`'s `Vars.table` is keyed by (indexname, *instantiated* type)
+        /// -- the type substitution is applied to the variable's type before the lookup -- and the
+        /// replacement is inserted as it stands, never re-normalised.  With `beta = false`
+        /// (`Term_Subst.instantiate`) nothing at all is contracted, redexes and all.  With
+        /// `beta = true` (`instantiate_beta`, which is what `\<^instantiate>` uses unless given
+        /// `no_beta`) `inst_beta_same` dispatches on the *head* of an application spine: only when the
+        /// head is a variable whose replacement is a lambda are the redexes it creates contracted, by
+        /// `Term.betapplys` against the substituted arguments, and the result is not re-normalised.
+        ///
+        /// `shyps` is taken from the recorded `shyps'`: `prep_insts` derives it from the certified
+        /// `Ctyp`/`Cterm` sorts, which are inherited and so cannot be recomputed from the raw types
+        /// and terms here.  The flex-flex pairs are substituted the same way.
         (proof::Instantiate, &[args, p]) => {
           let &[tysubst, subst, sorts, beta] = bp.get(args.as_ptr()).as_tuple_n();
           // `Thm.instantiate` and `Thm.instantiate_beta` share this rule and differ only in
@@ -2417,6 +2614,12 @@ impl<'a> Checker<'a> {
           let tpairs = self.map_tpairs(&mut |ck, t| inst.apply(ck, t), tpairs);
           CProof { shyps, hyps, tpairs, concl: inst.apply(self, concl) }
         }
+        /// `Thm.trivial ct`, recording the proposition and the cterm's `sorts` (this fork records the
+        /// term: ML's `trivial_proof` was nullary, which left the statement unrecoverable).
+        ///
+        /// Condition: the term has type `prop` (ML: "trivial: the term must have type prop").
+        ///
+        /// Result `A ⟹ A`, no hypotheses, no flex-flex pairs; `shyps` are the recorded cterm sorts.
         (proof::Trivial, &[t, sorts]) => {
           let t: TermId = self.parse(&mut m, bp, t);
           assert!(self.ctx[t].1.ty == Ok(TypeId::PROP), "trivial: the term must have type prop");
@@ -2424,6 +2627,14 @@ impl<'a> Checker<'a> {
           let concl = self.mk_imp(t, t);
           CProof { shyps, hyps: HypsId::EMPTY, tpairs: TpairsId::EMPTY, concl }
         }
+        /// `Thm.of_class (T, c)`, recording the type and the class.
+        ///
+        /// Condition: `Sign.of_sort thy (T, [c])`, checked against the class algebra built from the
+        /// theory's `classrel`/`arities` exports and the arity axioms.  Note the trace records the
+        /// *class* `c` while the resulting term mentions the constant `c_class`.
+        ///
+        /// Result `OFCLASS(T, c_class)`, i.e. `c_class (TYPE(T))` with `TYPE(T) = Const ("Pure.type",
+        /// itself T)`; `shyps` are the statement's own sorts; no hypotheses, no flex-flex pairs.
         (proof::OfClass, &[ty, c]) => {
           let OfClassCache { itself, type_ } = self.ofclass_cache.unwrap_or_else(|| {
             let itself = self.alloc("itself");
@@ -2446,6 +2657,21 @@ impl<'a> Checker<'a> {
           let concl: TermId = self.alloc(Term::App(c, ty2));
           CProof { shyps: self.ctx[concl].1.sorts, hyps: HypsId::EMPTY, tpairs: TpairsId::EMPTY, concl }
         }
+        /// A forked proof.  `Thm.future` hands the kernel a theorem whose derivation is empty until
+        /// the promise is joined, which is why proof terms forbid forking outright; this fork instead
+        /// records `PTPromise (i, prop, sorts)` naming the promise's *trace* serial, and
+        /// `Thm.future_result` exports the fulfilled proof as a trace of its own under that serial
+        /// when the future completes.  The serial comes from `Proofterm.proof_serial ()`, not from the
+        /// `serial ()` that identifies the promise, because the two are different counters and a trace
+        /// is cited in the proof-box namespace.
+        ///
+        /// `future_result` checks that the result has the promised proposition, no hypotheses, no
+        /// flex-flex pairs, no constraints, and `Sorts.subset (shyps, orig_shyps)`.  This arm mirrors
+        /// it: the cited trace must have been verified by this run, its statement must be the promised
+        /// one -- compared exactly, sorts included, since a promise trace is not `unconstrainT`-ed --
+        /// and its sort hypotheses must lie within the recorded ones.
+        ///
+        /// Result: `shyps` are the recorded cterm sorts, no hypotheses, no flex-flex pairs.
         (proof::Promise, &[i, t, sorts]) => {
           let i = i.as_uint();
           let concl: TermId = self.parse(&mut m, bp, t);
@@ -2460,12 +2686,38 @@ impl<'a> Checker<'a> {
           );
           CProof { shyps, hyps: HypsId::EMPTY, tpairs: TpairsId::EMPTY, concl }
         }
+        /// A citation of theorem `i` in `unconstrainT`-ed form -- `Proofterm.prepare_thm_proof` with
+        /// `unconstrain = true`, i.e. what `Thm.unconstrainT` produces.  Records only the serial.
+        ///
+        /// The statement is whatever the checker verified for that theorem, which for an exported
+        /// theorem is its header proposition: `⟦OFCLASS(?'a, c); …⟧ ⟹ prop` with the type variables
+        /// stripped of their sorts.  A citation of a theorem this run did not check is an error unless
+        /// it belongs to a parent session, which is trusted explicitly.
+        ///
+        /// Result: `shyps = [[]]` -- `Thm.unconstrainT` leaves exactly the trivial sort, the real ones
+        /// having become `OFCLASS` premises of the statement -- no hypotheses, no flex-flex pairs.
         (proof::Thm, &[i]) => {
           let i = i.as_uint();
           let concl = self.cited(i);
           let shyps = self.alloc(IdxBitSet::single(SortId::TOP));
           CProof { shyps, hyps: HypsId::EMPTY, tpairs: TpairsId::EMPTY, concl }
         }
+        /// An ordinary named citation -- `prepare_thm_proof` with `unconstrain = false`.  Records the
+        /// serial, the cited theorem's `shyps`, its `hyps`, and `prop = Logic.list_implies (hyps,
+        /// concl)`.
+        ///
+        /// Conditions: the recorded hypotheses are the leading premises of the recorded proposition,
+        /// so they are stripped back off and kept as hypotheses -- leaving them as premises as well
+        /// would count each one twice (the reference is used applied to `map Hyp hyps`).  And, when
+        /// this run checked theorem `i`, what it was verified to prove must reconcile with this
+        /// citation through exactly the same `unconstrainT` reconciliation that ends a proof: the
+        /// `OFCLASS` premises are peeled off, they must cover the recorded sort hypotheses, the
+        /// recorded hypotheses must match the statement's next premises, and the conclusions must
+        /// agree modulo the recorded type-variable map and sort stripping.  A citation of a parent
+        /// session's theorem is trusted, explicitly.
+        ///
+        /// Result: the recorded `shyps` and `hyps`, the stripped conclusion, and no flex-flex pairs --
+        /// a stored theorem may not have any (`name_derivation` rejects them).
         (proof::ConstrainThm, &[i, shyps, hyps, prop]) => {
           let i = i.as_uint();
           // the referenced theorem's own sort hypotheses, which the using theorem inherits
@@ -2514,6 +2766,13 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps, tpairs: TpairsId::EMPTY, concl }
         }
+        /// `Thm.varifyT_global'`, recording the `(TFree, TVar)` pairs it introduced.
+        ///
+        /// The statement and the flex-flex pairs are varified *together*: ML varifies
+        /// `attach_tpairs tpairs prop` and then strips the equations back off, so a type variable
+        /// shared between a pair and the statement stays shared.
+        ///
+        /// Not checked: that the `TFree`s fixed by the hypotheses were excluded from the renaming.
         (proof::Varify, &[args, p]) => {
           let mut subst = bp
             .parse_list(args)
@@ -2532,6 +2791,15 @@ impl<'a> Checker<'a> {
           let (tpairs, concl) = self.detach_tpairs(n, prop);
           CProof { shyps, hyps, tpairs, concl }
         }
+        /// `Thm.weaken ct` -- recorded only in this fork.  ML rebuilds the theorem record with a larger
+        /// `hyps`/`shyps` and reuses the derivation verbatim, so nothing about it reached the trace and
+        /// the checker's hypothesis set could silently be a strict subset of ML's.
+        ///
+        /// Conditions: the proposition has type `prop` and `maxidx = ~1` (ML: "weaken: assumptions may
+        /// not contain schematic variables").
+        ///
+        /// Result: `hyps` gains the proposition, `shyps` gains the cterm sorts, the statement and the
+        /// flex-flex pairs are unchanged.
         (proof::Weaken, &[a, sorts, p]) => {
           let a: TermId = self.parse(&mut m, bp, a);
           let TermData { ty, maxidx, .. } = self.ctx[a].1;
@@ -2544,6 +2812,15 @@ impl<'a> Checker<'a> {
           hyps.insert(h);
           CProof { shyps: self.union(shyps, sorts), hyps: self.alloc(hyps), tpairs, concl }
         }
+        /// `Thm.legacy_freezeT`, which records nothing at all, so the renaming is recomputed here.
+        ///
+        /// `Type.legacy_freeze` collects the `TFree` names of `attach_tpairs tpairs prop` as the used
+        /// set, then walks its `TVar`s in order of occurrence giving each a fresh `TFree` named by
+        /// `Name.variant_list used (string_of_indexname ix)` -- `string_of_indexname` is `a` at index 0
+        /// and `a_i` otherwise; `Name.variant` returns the name if it is free, else `Symbol.bump_init`
+        /// (append `a`, or `'` after a symbolic character) followed by `Symbol.bump_string` (increment
+        /// the trailing alphabetic run, `z` carrying to `a`) until it is.  The statement and the
+        /// flex-flex pairs are frozen together and the equations stripped off again.
         (proof::LegacyFreezeT, &[p]) => {
           let CProof { shyps, hyps, tpairs, concl } = self.ctx[m.proofs[&p]].0;
           let n = self.ctx[tpairs].0.len();
@@ -2554,6 +2831,22 @@ impl<'a> Checker<'a> {
           let (tpairs, concl) = self.detach_tpairs(n, prop);
           CProof { shyps, hyps, tpairs, concl }
         }
+        /// `Thm.lift_rule (goal, i)`, recording the goal's proposition `gprop`, the increment `inc`,
+        /// and the goal cterm's `sorts`.
+        ///
+        /// Condition: `inc` exceeds the goal's maxidx -- ML uses `inc = maxidx_of goal + 1`, and
+        /// anything less would identify a rule variable with a different goal variable of the same
+        /// name, because `Logic.lift_all` splices the goal's assumptions in verbatim.
+        ///
+        /// Result: every premise and the conclusion go through `Logic.lift_all`, which keeps the
+        /// goal's `⟹`/`⋀` skeleton, raises each schematic variable's index by `inc` and applies it to
+        /// the goal's parameters (`?x (Bound (lev+n-1)) … (Bound lev)`, its type extended by the
+        /// parameter types), and lifts the types of constants and frees too -- leaving a constant's
+        /// type unlifted would desynchronise it from its arguments.  The flex-flex pairs instead go
+        /// through `Logic.lift_abs`, which abstracts the parameters as `λ`s and drops the assumptions,
+        /// since a pair is a pair of terms rather than a proposition.
+        ///
+        /// `shyps = Sorts.union shyps sorts` -- ML's comment marks the argument order as deliberate.
         (proof::Lift, &[gprop, inc, sorts, p]) => {
           let gprop: TermId = self.parse(&mut m, bp, gprop);
           let inc: u32 = self.parse(&mut m, bp, inc);
@@ -2582,6 +2875,10 @@ impl<'a> Checker<'a> {
           let tpairs = self.map_tpairs(&mut |ck, t| lift.apply_abs(ck, t), tpairs);
           CProof { shyps, hyps, tpairs, concl }
         }
+        /// `Thm.incr_indexes i`, recording `i`.  `Logic.incr_indexes ([], i)` raises the index of every
+        /// schematic variable in the statement and in the flex-flex pairs, including inside the types
+        /// of constants and frees.  `i = 0` is the identity; `i < 0` is rejected by ML.  Hypotheses and
+        /// sort hypotheses are untouched.
         (proof::IncrIndexes, &[inc, p]) => {
           let inc: u32 = self.parse(&mut m, bp, inc);
           let CProof { shyps, hyps, tpairs, concl } = self.ctx[m.proofs[&p]].0;
@@ -2594,6 +2891,24 @@ impl<'a> Checker<'a> {
           };
           CProof { shyps, hyps, tpairs, concl }
         }
+        /// `Thm.assumption i`, recording the unifier, the subgoal index `i` and the assumption number
+        /// `n`.  The environment is recorded by this fork: `Unify.unifiers` returns a *sequence*, so
+        /// `n` alone does not say which unifier the tactic consumed, and without it the result cannot
+        /// be reconstructed.
+        ///
+        /// Condition: with `(close, asms, concl) = Logic.assum_problems (~1, Bᵢ)` -- all of the
+        /// subgoal's assumptions, `close` abstracting over its `⋀`-parameters with `rlist_abs` -- the
+        /// `n`-th assumption (1-based) and the conclusion, both closed, are identified by the unifier.
+        /// Checked after normalising both under the environment and eta-contracting them.  Also
+        /// checked: every `?'a::S := T` in the type environment satisfies `of_sort (norm T, S)`.
+        ///
+        /// Result `Logic.list_implies (Bs, C)`, i.e. subgoal `i` is dropped: normalised by
+        /// `Envir.norm_term` only when the environment is non-empty, ML's "avoid wasted
+        /// normalizations".  `shyps` gains the sorts of the types the environment assigns
+        /// (`Envir.insert_sorts`, type environment only).  The flex-flex pairs are normalised and the
+        /// ones that became trivial are dropped: ML keeps the *unifier's* leftovers -- it unifies
+        /// `(close asm, concl') :: tpairs`, so the theorem's own pairs take part and the solved ones
+        /// come back trivial -- and those leftovers are not recorded.
         (proof::Assumption, &[env, i_, n_, p]) => {
           let env = Subst::from_env(&mut (&mut *self, &mut m), bp, env);
           let empty_env = env.tysubst.is_empty() && env.subst.is_empty();
@@ -2653,6 +2968,15 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps, tpairs, concl: prop }
         }
+        /// `Thm.eq_assumption i`, recording only the subgoal index -- unlike `assumption` there is no
+        /// unifier, so nothing else is needed.
+        ///
+        /// Condition: some assumption of subgoal `i` is `Envir.aeconv` to its conclusion, i.e. equal up
+        /// to alpha *and* beta/eta contraction (`t aconv u orelse beta_eta_contract t aconv
+        /// beta_eta_contract u`).  ML records the index of the assumption it found; the result does not
+        /// depend on it, so the checker only requires that one exists.
+        ///
+        /// Result `Logic.list_implies (Bs, C)`; nothing is normalised and `shyps` is unchanged.
         (proof::EqAssumption, &[i_, p]) => {
           let i: u32 = self.parse(&mut m, bp, i_);
           let CProof { shyps, hyps, tpairs, concl: state } = self.ctx[m.proofs[&p]].0;
@@ -2682,6 +3006,17 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps, tpairs, concl: prop }
         }
+        /// `Thm.rotate_rule k i`, recording the subgoal index `i` and the rotation *already normalised*
+        /// by ML to `m = if k < 0 then n + k else k`, where `n` is the number of assumptions of that
+        /// subgoal.
+        ///
+        /// Condition: `m = 0` or `m = n` (the identity) or `0 < m < n`; anything else is
+        /// `THM ("rotate_rule")`.
+        ///
+        /// Result: subgoal `i` becomes `⋀params. ⟦qs; ps⟧ ⟹ concl` where `(ps, qs) = chop m asms`, its
+        /// `⋀`-parameters and conclusion unchanged.  The other subgoals, the conclusion of the state,
+        /// the hypotheses, the sort hypotheses and the flex-flex pairs are untouched, and nothing is
+        /// normalised.
         (proof::Rotate, &[m_, i_, p]) => {
           let rot = m_.as_int();
           let i: u32 = self.parse(&mut m, bp, i_);
@@ -2723,6 +3058,10 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps, tpairs, concl }
         }
+        /// `Thm.permute_prems j k`, recording both numbers.  The first `j` premises stay where they
+        /// are and the remaining `n` are rotated by `m = if k < 0 then n + k else k`, which must
+        /// satisfy `m = 0`, `m = n` or `0 < m < n`.  Everything else about the theorem is unchanged and
+        /// nothing is normalised.
         (proof::PermutePrems, &[j, k, p]) => {
           let j: u32 = self.parse(&mut m, bp, j);
           let k = k.as_int();
@@ -2749,6 +3088,56 @@ impl<'a> Checker<'a> {
           }
           CProof { shyps, hyps, tpairs, concl }
         }
+        /// `Thm.bicompose_aux` -- resolution, and the rule that carries the most recorded data.  The
+        /// rule `⟦rAs⟧ ⟹ B` is resolved against subgoal `Bᵢ` of the state `⟦Bs; Bᵢ⟧ ⟹ C`, giving
+        /// `⟦Bs; As⟧ ⟹ C` under a unifier.  `p` proves the rule and `q` the state (`deriv_rule2 … rder'
+        /// sder`).
+        ///
+        /// Recorded, in order: `env`, the unifier; `tpairs`, the flex-flex pairs it left unsolved,
+        /// which become the result's; `nsubgoal`, how many premises to peel off the rule
+        /// (`Logic.strip_prems`); `flatten`, whether the new subgoals went through
+        /// `Logic.flatten_params n`; `As`, those new subgoals as ML computed them; `A`, the rule's
+        /// first premise for eresolution and `NONE` otherwise; `n`, which assumption of `A`
+        /// eresolution discharged, `0` for ordinary resolution; `nlift`, recorded as
+        /// `Logic.count_prems (strip_all_body Bᵢ) + (if eres then ~1 else 0) + 1`; `nbs = length Bs`,
+        /// without which the new premises cannot be spliced back in; `smax`, the state's maxidx; and
+        /// `lifted`, whether the rule was lifted into the subgoal's context.  The last two are
+        /// recorded by this fork and exist only to reproduce the normalisation below.
+        ///
+        /// Conditions.  (1) The unifier identifies the rule's conclusion with the subgoal.  ML never
+        /// re-compares them -- it consumes `Unify.unifiers`' output -- so this is an extra check, and
+        /// it is made where ML's own bookkeeping allows: when `lifted`, the pair is shortened by
+        /// `strip_assums2` first, since lifting made the dropped assumptions equal by construction and
+        /// they are never unified; and a difference is accepted when it is one of the recorded
+        /// flex-flex pairs (which travel with the theorem as obligations), including a pair recorded
+        /// closed over the goal's parameters and met here with those `λ`s peeled off.  (2) For
+        /// eresolution, `Logic.assum_problems (nlift+1, A)` gives `A`'s assumptions and conclusion
+        /// closed over its parameters, and the `n`-th assumption must likewise be identified with the
+        /// conclusion.  (3) The recorded new subgoals must be the rule's own premises after
+        /// `rename_bvars`/`strip_apply` and, when `flatten`, `Logic.flatten_params n` -- compared
+        /// modulo an injective renaming of schematic variable base names, which is what
+        /// `rename_bvs`'s `del_clashing` produces, and which may not target a variable of the goal side
+        /// of the disagreement pair (`rename_bvs` filters those out, and that is the one way an
+        /// injective renaming could still capture).  (4) Every `?'a::S := T` in the type environment
+        /// satisfies `of_sort (norm T, S)`.
+        ///
+        /// Normalisation -- `addth`'s "minimal copying", which is observable because `Envir.norm_term`
+        /// is a full beta-normaliser and not merely a substitution:
+        ///
+        /// * `Envir.is_empty env`: *nothing* is normalised -- not `Bs`, not `As`, not `C`.  A redex
+        ///   present in any of them survives into the result.
+        /// * `Envir.above env smax` (the unifier assigns nothing at or below the state's maxidx, so it
+        ///   cannot touch the state): `Bs` and `C` are left alone and only `As` are normalised -- with
+        ///   `norm_term_skip env nlift` when `lifted`, which walks past the first `nlift` assumptions
+        ///   of each premise without touching them at all, normalising only the types of the
+        ///   `⋀`-parameters it passes, since flattening may have introduced new ones.
+        /// * otherwise: `Bs`, `As` and `C` are all normalised.
+        ///
+        /// Result `⟦Bs; As⟧ ⟹ C`.  `shyps = Envir.insert_sorts env (shyps₁ ∪ shyps₂)`, which folds over
+        /// the *type* environment only -- the terms the environment assigns are already accounted for
+        /// by the premises' own sort hypotheses.  `hyps = union_hyps`.  The flex-flex pairs are the
+        /// recorded ones, normalised unless the environment is empty; the premises' own pairs are not
+        /// unioned in, since they were part of the unification problem and are subsumed.
         (proof::Bicompose, &[args, p, q]) => {
           let args: BicomposeArgs = self.parse(&mut m, bp, args);
           let CProof { shyps: shyps1, hyps: hyps1, concl: rule, .. } = self.ctx[m.proofs[&p]].0;
